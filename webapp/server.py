@@ -23,6 +23,7 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 import trimesh
 from mesh2step.cut import apply_cuts, component_labels
@@ -1129,7 +1130,8 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
                 {"radius": round(c.radius, 4), "segments": c.segments} for c in circles[:24]
             ]
     token = uuid.uuid4().hex
-    _JOBS[token] = {"path": out_path, "name": f"{stem}.step", "ts": time.time()}
+    _JOBS[token] = {"path": out_path, "name": f"{stem}.step", "ts": time.time(),
+                    "stl": Path(stl_path)}   # the guided selection indexes this mesh's triangles
     try:  # the AI rebuild is extra; queueing it must never fail the conversion
         if recon and _recon_enabled():        # recon: this caller may spend on it (_recon_allowed)
             if _recon_admit():
@@ -1771,6 +1773,110 @@ def download(token: str):
     if not job or not job["path"].exists():
         raise HTTPException(404, "result expired or not found")
     return FileResponse(job["path"], media_type="application/step", filename=job["name"])
+
+
+# ---- guided feature selection (epic guided-*, owner 2026-10-12): after the deterministic
+# conversion the user picks features kind by kind on the converted mesh; edgebuild --labels
+# rebuilds from those picks. No AI.
+def _guide_tri(token: str):
+    job = _JOBS.get(token)
+    if not job or not job.get("stl") or not Path(job["stl"]).exists():
+        raise HTTPException(404, "result expired or not found")
+    if "tri" not in job:     # ponytail: kept in memory with the job (72 B/triangle); purged with it
+        import trimesh
+
+        job["tri"] = trimesh.load(job["stl"], process=False, force="mesh").triangles
+    return job, job["tri"]
+
+
+def _guide_error(e: ValueError):
+    return HTTPException(400 if "kind" in str(e) or "twice" in str(e) else 422, str(e))
+
+
+@app.get("/api/guide/{token}/mesh")
+def guide_mesh(token: str):
+    _, tri = _guide_tri(token)
+    pos = __import__("numpy").round(tri, 5).reshape(-1).tolist()
+    return {"positions": pos, "n_triangles": len(tri)}
+
+
+@app.get("/api/guide/{token}/suggest")
+def guide_suggest(token: str, kind: str):
+    from mesh2step import guide
+
+    job, tri = _guide_tri(token)
+    cache = job.setdefault("suggest", {})
+    if kind not in cache:
+        try:
+            cache[kind] = guide.suggest(tri, kind)
+        except ValueError as e:
+            raise _guide_error(e) from e
+    return {"regions": cache[kind]}
+
+
+class GrowBody(BaseModel):
+    seed: int
+    kind: str
+
+
+@app.post("/api/guide/{token}/grow")
+def guide_grow(token: str, body: GrowBody):
+    from mesh2step import guide
+
+    _, tri = _guide_tri(token)
+    if not 0 <= body.seed < len(tri):
+        raise HTTPException(400, f"seed {body.seed} is not a triangle of this mesh")
+    try:
+        return guide.grow(tri, body.seed, body.kind)
+    except ValueError as e:
+        raise _guide_error(e) from e
+
+
+class BuildBody(BaseModel):
+    selections: list[dict]
+
+
+@app.post("/api/guide/{token}/build")
+def guide_build(token: str, body: BuildBody):
+    """Rebuild from the user's selections.
+    ponytail: runs in the request thread under EDGEBUILD_TIMEOUT_S; move it onto a job pool if
+    guided builds start queueing behind each other."""
+    import ast
+    import json
+    import shutil
+    import signal
+    import subprocess
+
+    from mesh2step import guide
+
+    job, tri = _guide_tri(token)
+    try:
+        payload = guide.labels(len(tri), body.selections)
+    except (ValueError, KeyError, TypeError) as e:
+        raise HTTPException(400, f"bad selections: {e}") from e
+    work = Path(tempfile.mkdtemp(prefix="mesh2step_guide_"))
+    labels, out = work / "labels.json", work / f"{Path(job['name']).stem}.guided.step"
+    labels.write_text(json.dumps(payload))
+    cmd = [sys.executable, str(EDGEBUILD), str(job["stl"]), str(out), "--labels", str(labels)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                            start_new_session=True)
+    try:
+        stdout, _ = proc.communicate(timeout=EDGEBUILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(422, "the rebuild ran out of time") from None
+    line = next((ln for ln in reversed(stdout.splitlines()) if ln.startswith("RESULT ")), None)
+    fail = next((ln[5:] for ln in stdout.splitlines() if ln.startswith("FAIL ")), "no result")
+    result = ast.literal_eval(line[7:].split(" radii ")[0]) if line else None
+    if not result or not out.exists() or not (result["valid"] and result["solids"] >= 1):
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(422, {"error": fail, "result": result})
+    new = uuid.uuid4().hex
+    _JOBS[new] = {"path": out, "name": out.name, "ts": time.time()}
+    _cap_registries()
+    return {"token": new, "result": result}
 
 
 
