@@ -1297,11 +1297,26 @@ function renderResult(data) {
       + `${s.is_solid ? 'Ready to download' : 'Converted, but not a sealed solid'}</div>`
     + lines.map((t) => `<div class="result-line">${t}</div>`).join('')
     + `<div class="result-line quiet">${[kb, secs].filter(Boolean).join(' · ')}</div>`
-    + `<button class="download-btn" id="dl-main">Download ${s.output_path}</button>`;
+    + `<button class="download-btn" id="dl-main">Download ${s.output_path}</button>`
+    + `<button class="download-btn" id="guide-start">Refine features</button><div id="guide-host"></div>`;
   resultEl.classList.remove('hidden');
   document.getElementById('dl-main').addEventListener('click', () => {
     // ponytail: relative URL so the app works behind the /mesh2step/ path prefix
     window.location.href = `api/download/${data.download_token}`;
+  });
+  // guided feature selection (owner 2026-10-12): the user picks features kind by kind, no AI
+  document.getElementById('guide-start').addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    const { startGuide } = await import('./guide.js');
+    startGuide({
+      THREE, scene, camera, canvas, token: data.download_token,
+      panel: document.getElementById('guide-host'),
+      hideOthers: () => {
+        for (const o of [currentMesh, resultMesh, resultEdges, leftoverMesh]) if (o) o.visible = false;
+        viewSelect.disabled = true;
+      },
+      showResult: (tok) => showResultPreview(tok),
+    });
   });
   renderStats(data);
   showResultPreview(data.download_token);
