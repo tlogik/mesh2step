@@ -13,6 +13,10 @@ tube are the same code path: the intersection of two surfaces.
    curve through points projected exactly onto both surfaces;
 5. faces = surface + wires of shared edges, sewn, solid, STEP.
 usage: edgebuild.py <mesh.stl> <out.step>    prints RESULT {...} radii [...]; exit 3 = not buildable here
+       edgebuild.py <mesh.stl> <out.step> --labels L.json
+--labels: the user's guided selection (epic guided-*, 2026-10-12),
+{"label": [id per INPUT triangle, -1 = none], "kinds": {"id": "plane|cylinder|cone|sphere|torus"}},
+laid over regions()' labelling before anything is fitted.
 """
 import collections, math, os, sys, time
 from pathlib import Path
@@ -60,6 +64,11 @@ def fail(msg):
     sys.exit(3)
 
 
+USER_LABELS = None
+if "--labels" in sys.argv:
+    i_ = sys.argv.index("--labels")
+    USER_LABELS = Path(sys.argv[i_ + 1])
+    del sys.argv[i_:i_ + 2]
 src, out = Path(sys.argv[1]), Path(sys.argv[2])
 
 # ---------------------------------------------------------------- 1. clean + segment
@@ -110,6 +119,29 @@ r = regions(body.triangles)
 V, F = r["topology"][0], r["topology"][1]
 label = np.array(r["label"]).copy()
 kinds = list(r["kinds"])
+n_user = 0
+if USER_LABELS:
+    # the user's labels refer to INPUT triangles; welding, body splitting and T-junction splits
+    # renumber them, so each final triangle takes the label of the input triangle its centroid
+    # lies on (welding moves vertices <= EB_WELD*diag, a split child lies inside its parent)
+    import json
+    ul_ = json.loads(USER_LABELS.read_text())
+    uk_ = {int(k): v for k, v in ul_["kinds"].items()}
+    ok_ = ("plane", "cylinder", "cone", "sphere", "torus")
+    if bad_ := {v for v in uk_.values() if v not in ok_}:
+        fail(f"bad kind {sorted(bad_)} in --labels")
+    src_ = trimesh.Trimesh(m.vertices, m.faces, process=False)
+    u_ = np.asarray(ul_["label"])[src_.nearest.on_surface(V[F].mean(1))[2]]
+    for uid_ in sorted(set(u_[u_ >= 0].tolist())):
+        label[u_ == uid_] = len(kinds)
+        kinds.append(uk_[uid_])
+        n_user += 1
+    # regions() labels the user took over entirely are dropped
+    used_ = sorted(set(label[label >= 0].tolist()))
+    remap_ = np.full(len(kinds), -1)
+    remap_[used_] = np.arange(len(used_))
+    label = np.where(label >= 0, remap_[np.maximum(label, 0)], -1)
+    kinds = [kinds[i] for i in used_]
 tri = V[F]
 nt = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]); area = np.linalg.norm(nt, axis=1) / 2
 nt = nt / np.maximum(2 * area[:, None], 1e-30)
@@ -2448,5 +2480,7 @@ if not mm["valid"]:
     if rb_ is not None and tangent_corner_tolerances(rb_) and _BCA(rb_).IsValid():
         mm["valid"] = True
         log("read-back solid valid once its tangent-arc corners carry their contact zone")
+if USER_LABELS:
+    mm["user_labels"] = n_user
 log("RESULT", {k: (round(v, 5) if isinstance(v, float) else v) for k, v in mm.items() if k != "radii"},
     "radii", sorted({round(x, 4) for x in mm["radii"]}))
