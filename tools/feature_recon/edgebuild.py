@@ -64,6 +64,9 @@ def fail(msg):
     sys.exit(3)
 
 
+SCANPREP = "--scanprep" in sys.argv   # scanned input: denoise first (scanprep.py)
+if SCANPREP:
+    sys.argv.remove("--scanprep")
 USER_LABELS = None
 if "--labels" in sys.argv:
     i_ = sys.argv.index("--labels")
@@ -73,6 +76,10 @@ src, out = Path(sys.argv[1]), Path(sys.argv[2])
 
 # ---------------------------------------------------------------- 1. clean + segment
 m = trimesh.load(src, process=False)
+if SCANPREP:
+    from scanprep import prep
+    m, rep_ = prep(m)
+    log("SCANPREP", rep_)
 V0 = m.vertices[m.faces.reshape(-1)]
 diag = float(np.linalg.norm(V0.max(0) - V0.min(0)))
 key = np.round(V0 / (float(os.environ.get("EB_WELD", "1.5e-4")) * diag)).astype(np.int64)   # EB_WELD: probe rung
