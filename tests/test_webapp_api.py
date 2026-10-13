@@ -836,7 +836,10 @@ def test_the_registries_are_capped_not_merely_expired(tmp_path):
 def test_pending_eviction_prefers_finished_tickets_over_running_ones(tmp_path):
     """Dropping a running ticket loses work someone is still waiting on."""
     import webapp.server as srv
+    import time
     from concurrent.futures import Future
+
+    from webapp import server
 
     keep = dict(srv._PENDING)
     srv._PENDING.clear()
@@ -985,3 +988,19 @@ def test_the_monitor_names_the_callers(client, monkeypatch):
     assert t["origin"] == "https://elsewhere.example/x"             # kept: a 404 sends no referer
     assert by_ip["100.64.1.2"]["internal"] is True                             # tailnet is not a visitor
     assert cl["unique_last_hour"] == 2 and cl["external_last_hour"] == 1
+
+
+def test_stats_purges_expired_pending():
+    """pending_jobs counted expired tickets until the next upload, so safe_restart.sh waited 4 h on an idle node."""
+    import time
+    from concurrent.futures import Future
+
+    from webapp import server
+    fut = Future()
+    fut.set_result({})
+    server._PENDING["expired-ticket"] = {"future": fut, "ts": time.time() - server.RESULT_TTL_S - 1}
+    try:
+        server._node_stats()
+        assert "expired-ticket" not in server._PENDING
+    finally:
+        server._PENDING.pop("expired-ticket", None)

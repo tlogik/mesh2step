@@ -1586,6 +1586,9 @@ def _pct(values, q):
 
 
 def _node_stats() -> dict:
+    # the TTL purge otherwise runs only on a new upload: expired tickets kept pending_jobs > 0 for hours
+    # and tools/safe_restart.sh waited forever on an idle node (2026-10-13)
+    _purge_expired()
     now = time.time()
     with _admission_lock:
         queue = [{"position": i + 1, "waiting_s": round(now - q.get("queued_at", now))}
