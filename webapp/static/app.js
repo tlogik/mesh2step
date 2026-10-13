@@ -1309,7 +1309,7 @@ function renderResult(data) {
     e.target.disabled = true;
     const { startGuide } = await import('./guide.js');
     startGuide({
-      THREE, scene, camera, canvas, token: data.download_token,
+      THREE, scene, camera, canvas, controls, token: data.download_token,
       panel: document.getElementById('guide-host'),
       hideOthers: () => {
         for (const o of [currentMesh, resultMesh, resultEdges, leftoverMesh]) if (o) o.visible = false;

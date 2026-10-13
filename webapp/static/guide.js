@@ -1,18 +1,33 @@
 // guided feature selection — written in M3 (see .claude/loopspec/guided-m3-guide-ui.spec.md)
 export async function startGuide(ctx) {
-  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult } = ctx;
+  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls } = ctx;
   hideOthers();
   // Make panel fixed on top of the canvas so buttons are clickable
   panel.style.cssText = 'position:fixed;top:10px;right:10px;width:280px;z-index:99999;background:#fff;padding:10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);font-family:system-ui,sans-serif;font-size:14px;';
 
-  const meshData = await (await fetch(`api/guide/${token}/mesh`)).json();
-  const positions = new Float32Array(meshData.positions);
-
+  let positions, centres, normals, brushR;
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  const colors = new Float32Array(positions.length);
-  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  geo.computeVertexNormals();
+  async function loadMesh(scan) {
+    const meshData = await (await fetch(`api/guide/${token}/mesh${scan ? '?scan=true' : ''}`)).json();
+    positions = new Float32Array(meshData.positions);
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(positions.length), 3));
+    geo.computeVertexNormals();
+    // per-triangle centre and unit normal, for the brush
+    const n = positions.length / 9;
+    centres = new Float32Array(n * 3); normals = new Float32Array(n * 3);
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+    for (let t = 0; t < n; t++) {
+      a.fromArray(positions, t * 9); b.fromArray(positions, t * 9 + 3); c.fromArray(positions, t * 9 + 6);
+      centres[t * 3] = (a.x + b.x + c.x) / 3; centres[t * 3 + 1] = (a.y + b.y + c.y) / 3; centres[t * 3 + 2] = (a.z + b.z + c.z) / 3;
+      b.sub(a); c.sub(a); b.cross(c).normalize(); b.toArray(normals, t * 3);
+    }
+    geo.computeBoundingBox();
+    geo.computeBoundingSphere();      // the raycaster culls on it: stale after the scan mesh swap
+    brushR = geo.boundingBox.getSize(new THREE.Vector3()).length() * 0.02;
+    return meshData;
+  }
+  await loadMesh(false);
 
   const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide });
   const mesh = new THREE.Mesh(geo, mat);
@@ -22,6 +37,7 @@ export async function startGuide(ctx) {
   const C_SUGGEST = new THREE.Color(0xf59e0b);
   const C_SEL_CUR = new THREE.Color(0x4ade80);
   const C_SEL_PRIOR = new THREE.Color(0x888899);
+  const C_PAINT = new THREE.Color(0x3b82f6);
 
   const steps = [
     ['cylinder', 'Cylinders'],
@@ -36,6 +52,8 @@ export async function startGuide(ctx) {
   let step = 0;
   let selections = [];
   let suggested = [];
+  let brushing = false;
+  let painted = new Set();
 
   // --- UI ---
   const wrap = document.createElement('div');
@@ -62,6 +80,16 @@ export async function startGuide(ctx) {
   const nextBtn = el('button', 'guide-next', 'Next');
   const buildBtn = el('button', 'guide-build', 'Build STEP');
   buildBtn.style.display = 'none';
+  const scanBtn = el('button', 'guide-scan', 'This is a 3D scan');
+  scanBtn.title = 'Denoise the mesh, suggest surfaces found in the scan, and fit brushed areas on the raw scan';
+  const brushBtn = el('button', 'guide-brush', 'Brush');
+  brushBtn.title = 'Paint a face (drag), then Fit: the surface of the current kind through the painted area';
+  const brushSize = el('input', 'guide-brush-size');
+  brushSize.type = 'range'; brushSize.min = '0.25'; brushSize.max = '4'; brushSize.step = '0.25'; brushSize.value = '1';
+  brushSize.title = 'Brush size';
+  brushSize.style.cssText = 'width:80px;vertical-align:middle;';
+  const fitBtn = el('button', 'guide-fit', 'Fit painted');
+  const clearBtn = el('button', 'guide-clear', 'Clear paint');
   const statusEl = el('div', 'guide-status');
   statusEl.style.cssText = 'margin-top:6px;color:#c00;min-height:1.2em;';
   const dl = el('a', 'guide-download', 'Download refined STEP');
@@ -95,6 +123,12 @@ export async function startGuide(ctx) {
         }
       }
     }
+    for (const t of painted) {
+      for (let v = 0; v < 3; v++) {
+        const i = (t * 3 + v) * 3;
+        arr[i] = C_PAINT.r; arr[i + 1] = C_PAINT.g; arr[i + 2] = C_PAINT.b;
+      }
+    }
     geo.getAttribute('color').needsUpdate = true;
   }
 
@@ -106,7 +140,10 @@ export async function startGuide(ctx) {
       undoBtn.style.display = '';
       skipBtn.style.display = '';
       nextBtn.style.display = '';
+      for (const b of [brushBtn, brushSize, fitBtn, clearBtn]) b.style.display = '';
     } else {
+      for (const b of [brushBtn, brushSize, fitBtn, clearBtn]) b.style.display = 'none';
+      setBrush(false);
       stepTitle.textContent = `Step ${N}/${N} \u2014 Build`;
       buildBtn.style.display = '';
       acceptBtn.style.display = 'none';
@@ -142,30 +179,29 @@ export async function startGuide(ctx) {
     updateUI();                       // the new step shows at once; suggestions arrive after the fetch
     if (step < steps.length) {
       const kind = steps[step][0];
+      let pending = false;
       try {
         const resp = await fetch(`api/guide/${token}/suggest?kind=${kind}`);
         if (resp.ok) {
           const data = await resp.json();
           suggested = data.regions || [];
+          pending = !!data.pending;
         }
       } catch (_) { /* ignore */ }
-      paramsEl.textContent = suggested.length
+      paramsEl.textContent = (suggested.length
         ? `${suggested.length} suggestion${suggested.length !== 1 ? 's' : ''}`
-        : 'click a surface to select it';
+        : 'click or brush a surface to select it')
+        + (pending ? ' \u2014 still finding surfaces in the scan, brush meanwhile' : '');
+      // a scan's surfaces are found in the background (minutes): ask again while this step is open
+      if (pending) { const s0 = step; setTimeout(() => { if (step === s0) enterStep(); }, 10000); }
     }
     updateUI();
     recolour();
   }
 
   // --- click handling ---
-  let pdX = 0, pdY = 0;
-  canvas.addEventListener('mousedown', e => { pdX = e.clientX; pdY = e.clientY; });
-
-  canvas.addEventListener('mouseup', async e => {
-    if (Math.hypot(e.clientX - pdX, e.clientY - pdY) > 6) return;
-    if (step >= steps.length) return;
-
-    const kind = steps[step][0];
+  let pdX = 0, pdY = 0, painting = false;
+  function hitAt(e) {
     const rect = canvas.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -173,9 +209,42 @@ export async function startGuide(ctx) {
     );
     const ray = new THREE.Raycaster();
     ray.setFromCamera(ndc, camera);
-    const hits = ray.intersectObject(mesh);
-    if (!hits.length) return;
-    const fi = hits[0].faceIndex;
+    return ray.intersectObject(mesh)[0];
+  }
+  // the brush: every triangle within the brush radius of the hit point that faces the same side
+  // (a thin wall's far side is within reach but faces away). ponytail: O(triangles) per stroke event
+  function paintAt(e) {
+    const h = hitAt(e);
+    if (!h) return;
+    const R = brushR * Number(brushSize.value), R2 = R * R, f = h.faceIndex;
+    const nx = normals[f * 3], ny = normals[f * 3 + 1], nz = normals[f * 3 + 2];
+    for (let t = 0; t < centres.length / 3; t++) {
+      const dx = centres[t * 3] - h.point.x, dy = centres[t * 3 + 1] - h.point.y, dz = centres[t * 3 + 2] - h.point.z;
+      if (dx * dx + dy * dy + dz * dz <= R2 && normals[t * 3] * nx + normals[t * 3 + 1] * ny + normals[t * 3 + 2] * nz > 0) painted.add(t);
+    }
+    recolour();
+  }
+  function setBrush(on) {
+    brushing = on;
+    if (controls) controls.enabled = !on;
+    brushBtn.style.background = on ? '#3b82f6' : '';
+    brushBtn.style.color = on ? '#fff' : '';
+  }
+  canvas.addEventListener('mousedown', e => {
+    pdX = e.clientX; pdY = e.clientY;
+    if (brushing && step < steps.length) { painting = true; paintAt(e); }
+  });
+  canvas.addEventListener('mousemove', e => { if (painting) paintAt(e); });
+
+  canvas.addEventListener('mouseup', async e => {
+    if (painting) { painting = false; return; }
+    if (Math.hypot(e.clientX - pdX, e.clientY - pdY) > 6) return;
+    if (step >= steps.length) return;
+
+    const kind = steps[step][0];
+    const hit = hitAt(e);
+    if (!hit) return;
+    const fi = hit.faceIndex;
 
     for (const s of selections) {
       if (s.triangles.includes(fi)) {
@@ -238,6 +307,50 @@ export async function startGuide(ctx) {
     recolour();
   });
 
+  scanBtn.addEventListener('click', async () => {
+    scanBtn.disabled = true;
+    statusEl.textContent = 'Denoising the scan\u2026';
+    try {
+      await loadMesh(true);
+      selections = []; painted = new Set();
+      statusEl.textContent = 'Finding surfaces in the scan\u2026';
+      scanBtn.textContent = '3D scan mode';
+      await enterStep();
+      statusEl.textContent = '';
+    } catch (e2) {
+      statusEl.textContent = 'Error: ' + e2.message;
+      scanBtn.disabled = false;
+    }
+  });
+
+  brushBtn.addEventListener('click', () => setBrush(!brushing));
+  clearBtn.addEventListener('click', () => { painted = new Set(); recolour(); });
+
+  fitBtn.addEventListener('click', async () => {
+    if (step >= steps.length || !painted.size) { statusEl.textContent = 'paint a face first'; return; }
+    const kind = steps[step][0];
+    const selSet = new Set();
+    for (const s of selections) for (const t of s.triangles) selSet.add(t);
+    const tris = [...painted].filter(t => !selSet.has(t));
+    statusEl.textContent = 'Fitting\u2026';
+    try {
+      const resp = await fetch(`api/guide/${token}/fit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ triangles: tris, kind }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) { statusEl.textContent = data.detail || 'Fit failed'; return; }
+      selections.push({ kind, surface: data.surface, triangles: data.triangles });
+      painted = new Set();
+      statusEl.textContent = '';
+      paramsEl.textContent = fmtParam(data);
+      recolour();
+    } catch (e2) {
+      statusEl.textContent = 'Error: ' + e2.message;
+    }
+  });
+
   undoBtn.addEventListener('click', () => {
     if (selections.length) { selections.pop(); recolour(); }
   });
@@ -270,7 +383,8 @@ export async function startGuide(ctx) {
 
   // --- test hooks ---
   window.__guide = {
-    mesh: positions,
+    get mesh() { return positions; },
+    get painted() { return painted; },
     get selections() { return selections; },
     get step() { return step; },
     project(i) {
