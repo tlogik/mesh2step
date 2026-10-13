@@ -64,6 +64,10 @@ def fail(msg):
     sys.exit(3)
 
 
+SCANPREP = "--scanprep" in sys.argv   # scanned input: denoise first (scanprep.py)
+if SCANPREP:
+    sys.argv.remove("--scanprep")
+SCAN = SCANPREP or bool(os.environ.get("EB_SCAN"))   # scanned input: region tests tolerate blurred edges
 USER_LABELS = None
 if "--labels" in sys.argv:
     i_ = sys.argv.index("--labels")
@@ -73,6 +77,10 @@ src, out = Path(sys.argv[1]), Path(sys.argv[2])
 
 # ---------------------------------------------------------------- 1. clean + segment
 m = trimesh.load(src, process=False)
+if SCANPREP:
+    from scanprep import prep
+    m, rep_ = prep(m)
+    log("SCANPREP", rep_)
 V0 = m.vertices[m.faces.reshape(-1)]
 diag = float(np.linalg.norm(V0.max(0) - V0.min(0)))
 key = np.round(V0 / (float(os.environ.get("EB_WELD", "1.5e-4")) * diag)).astype(np.int64)   # EB_WELD: probe rung
@@ -309,6 +317,38 @@ def refit_keep(s, P):
     return new
 
 
+def scan_rev(ts, P, k):
+    """Cone or torus of a labelled scan region, no acceptance gate: the axis is the line every facet normal line
+    meets (Pottmann and Randrup 1998, as regions.fit_revolution), the meridian profile (height, radius) a line
+    (cone) or a circle (torus). refine() then fits it to the vertices; the label already names the kind."""
+    X = V[F[ts]].mean(1); D = nt[ts]; w = area[ts]
+    Lc = np.c_[np.cross(X, D), D]
+    ev_ = np.linalg.eigh((Lc * w[:, None]).T @ Lc)[1][:, 0]
+    abar, ax = ev_[:3], ev_[3:]
+    na = np.linalg.norm(ax)
+    if na < 1e-9:
+        return None
+    ax, abar = ax / na, abar / na
+    c = np.cross(ax, abar)
+    q = P - c; h = q @ ax; rho = np.linalg.norm(q - np.outer(h, ax), axis=1)
+    if k == "cone":
+        # the line complex is degenerate for a cone (many complexes hold its normal lines): its axis is the direction
+        # the facet normals vary least along (n.a = sin of the semi-angle), its apex the point on every tangent plane.
+        # A narrow band has a second such direction (its mean normal): keep the candidate whose profile fits best.
+        X = V[F[ts]].mean(1)
+        Cm = np.einsum("i,ij,ik->jk", w, D, D)
+        apex = np.linalg.lstsq(Cm, np.einsum("i,ij,i->j", w, D, np.einsum("ij,ij->i", D, X)), rcond=None)[0]
+        best = None
+        for a_ in np.linalg.eigh(np.cov(D.T, aweights=w))[1][:, :2].T:
+            q = P - apex; h = q @ a_; rho = np.linalg.norm(q - np.outer(h, a_), axis=1)
+            kk = np.polyfit(h, rho, 1); res = float(np.abs(np.polyval(kk, h) - rho).mean())
+            if best is None or res < best[0]:
+                best = (res, a_, kk)
+        return ("cone", None, (best[1], apex, best[2]))
+    cc, r, _ = fit_circle(np.c_[h, rho])
+    return ("torus", (float(cc[1]), float(r)), (ax, c, cc))
+
+
 def fit(L):
     ts = region_tris(L); P = region_verts(L); k = kinds[L]
     if k == "plane":
@@ -326,7 +366,10 @@ def fit(L):
         s["o"] = c2[0] * s["u"] + c2[1] * s["w"]; s["R"] = float(R)
         return s
     big = 0.05 * diag
-    mdl = (fit_smooth if k == "cone" else fit_revolution)(list(ts), V, F, nt, area, big)
+    if SCAN:   # their gates (normal spread < 0.02 rad, pitch 0, every vertex near) reject every scanned region
+        mdl = scan_rev(ts, P, k)
+    else:
+        mdl = (fit_smooth if k == "cone" else fit_revolution)(list(ts), V, F, nt, area, big)
     if mdl is None or mdl[0] != k:
         return None
     if k == "cone":
@@ -413,8 +456,11 @@ for L in list(S):
     # 7-triangle wall strip as a cylinder, refit later as an R 19.6 sphere, its corners 0.13 mm apart)
     Pv_f = V[np.unique(F[ts])]; c_f = Pv_f.mean(0); n_f = np.linalg.svd(Pv_f - c_f)[2][-1]
     flat_ = len(Pv_f) >= 3 and float(np.abs((Pv_f - c_f) @ n_f).max()) < 1e-6 * diag
-    if (not flat_ and np.abs(sdist(s, cen_)).max() < 5e-3 * diag and all(0 < z_ < diag for z_ in sizes_)
-            and np.abs(np.einsum("ij,ij->i", g_, nt[ts])).min() > math.cos(math.radians(20))):
+    if (not flat_ and np.quantile(np.abs(sdist(s, cen_)), 0.95 if SCAN else 1.0) < 5e-3 * diag and all(0 < z_ < diag for z_ in sizes_)
+            and (SCAN or np.abs(np.einsum("ij,ij->i", g_, nt[ts])).min() > math.cos(math.radians(20)))):
+        # EB_SCAN: no facing test. A scan blurs every edge over a triangle, so rim triangles of a true face face its
+        # neighbour (CAD-truth labels, 2026-10-13: a 0.48 mm hole worst 89.6 deg, its 10th percentile still > 20 deg);
+        # splitting it made 265 one-triangle planes whose corners cannot meet. The distance test still applies.
         continue
     if os.environ.get("EB_DUMP_TRIS") and str(L) in os.environ["EB_DUMP_TRIS"].split(","):
         # what a rejected curved region is made of: facet normal directions and where its triangles sit

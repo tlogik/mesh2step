@@ -1796,11 +1796,53 @@ def _guide_error(e: ValueError):
     return HTTPException(400 if "kind" in str(e) or "twice" in str(e) else 422, str(e))
 
 
+def _scan(job):
+    """Scan mode (bd projects-vgj7 P4), entered once per job by GET mesh?scan=true: the user selects on the scanprep
+    mesh, suggestions add scanransac.detect regions, brush fits run on the raw scan under the paint, and the build
+    labels unselected triangles from detect and runs edgebuild with EB_SCAN. CAD meshes never enter it."""
+    if "scan" not in job:
+        import trimesh
+
+        sys.path.insert(0, str(EDGEBUILD.parent))
+        from scanprep import _noise, prep
+
+        raw = trimesh.load(job["stl"], force="mesh")     # merged vertices: the noise estimate needs adjacency
+        pm = prep(raw)[0]
+        stl = Path(job["stl"]).with_suffix(".prep.stl")
+        pm.export(stl)
+        from scanransac import detect
+
+        job["scan"] = {"raw": raw, "prep": pm, "stl": stl, "noise": _noise(raw.vertices, raw.faces),
+                       "det": _SCAN_POOL.submit(detect, pm)}
+        job["tri"] = pm.triangles
+        job.pop("suggest", None)
+    return job["scan"]
+
+
+# detect takes minutes on a real scan (2026-10-13: 121 s at 25k triangles, 433-1408 s at 100k), so it starts when
+# scan mode is entered and the user brushes meanwhile. ponytail: one thread, GIL-shared with the server (detect is
+# mostly numpy/scipy); a process pool if it starts starving requests
+_SCAN_POOL = ThreadPoolExecutor(1, thread_name_prefix="scan-detect")
+
+
+def _ui_params(kind, p):
+    """scanransac parameters in guide's shape (the page reads radius / half_angle in radians)."""
+    p = dict(p)
+    if kind == "cone":
+        p["half_angle"] = float(__import__("numpy").deg2rad(p["angle"]))
+    if kind == "torus":
+        p["radius"] = p["minor"]
+    return p
+
+
 @app.get("/api/guide/{token}/mesh")
-def guide_mesh(token: str):
-    _, tri = _guide_tri(token)
+def guide_mesh(token: str, scan: bool = False):
+    job, _ = _guide_tri(token)
+    if scan:
+        _scan(job)
+    tri = job["tri"]
     pos = __import__("numpy").round(tri, 5).reshape(-1).tolist()
-    return {"positions": pos, "n_triangles": len(tri)}
+    return {"positions": pos, "n_triangles": len(tri), "scan": "scan" in job}
 
 
 @app.get("/api/guide/{token}/suggest")
@@ -1814,6 +1856,17 @@ def guide_suggest(token: str, kind: str):
             cache[kind] = guide.suggest(tri, kind)
         except ValueError as e:
             raise _guide_error(e) from e
+        if "scan" in job:     # guide fits at CAD tolerance; on a scan the RANSAC regions are the suggestions
+            import numpy as np
+
+            if not job["scan"]["det"].done() or job["scan"]["det"].exception():
+                return {"regions": cache.pop(kind), "pending": True}
+            det = job["scan"]["det"].result()
+            lab = np.asarray(det["label"])
+            cache[kind] = cache[kind] + [
+                {"triangles": np.flatnonzero(lab == int(i)).tolist(), "surface": k, "kind": k,
+                 "params": _ui_params(k, det["params"][i])}
+                for i, k in det["kinds"].items() if k == kind]
     return {"regions": cache[kind]}
 
 
@@ -1835,6 +1888,41 @@ def guide_grow(token: str, body: GrowBody):
         raise _guide_error(e) from e
 
 
+class FitBody(BaseModel):
+    triangles: list[int]
+    kind: str
+
+
+@app.post("/api/guide/{token}/fit")
+def guide_fit(token: str, body: FitBody):
+    """The brush: the user paints a face and names its kind; least squares fits it, no acceptance gate."""
+    import numpy as np
+    import trimesh
+
+    sys.path.insert(0, str(EDGEBUILD.parent))
+    from scanransac import fit
+
+    job, tri = _guide_tri(token)
+    surface = {"fillet": "cylinder", "chamfer": "plane"}.get(body.kind, body.kind)
+    t = sorted(set(body.triangles))
+    if len(t) < 6 or t[0] < 0 or t[-1] >= len(tri):
+        raise HTTPException(400, "paint at least 6 triangles of this mesh")
+    scan = job.get("scan")
+    if scan:
+        mesh, raw, noise = scan["prep"], scan["raw"], scan["noise"]
+    else:      # ponytail: rebuilt per stroke (a soup of len(tri) faces, milliseconds); cache if strokes get slow
+        mesh = trimesh.Trimesh(tri.reshape(-1, 3), np.arange(3 * len(tri)).reshape(-1, 3), process=False)
+        raw, noise = None, 0.0
+    try:
+        r = fit(mesh, t, surface, raw=raw, noise=noise)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001 - a degenerate paint (one flat facet for a sphere) is the user's to redo
+        raise HTTPException(422, f"could not fit a {surface} to the painted area: {e}") from e
+    return {"triangles": t, "kind": body.kind, "surface": surface, "rms": r["rms"],
+            "params": _ui_params(surface, {k: v for k, v in r.items() if k not in ("kind", "rms")})}
+
+
 class BuildBody(BaseModel):
     selections: list[dict]
 
@@ -1853,14 +1941,32 @@ def guide_build(token: str, body: BuildBody):
     from mesh2step import guide
 
     job, tri = _guide_tri(token)
+    sel = list(body.selections)
+    scan = job.get("scan")
+    if scan:   # every triangle needs a surface: what the user did not select comes from detect
+        import numpy as np
+
+        used = {t for s_ in sel for t in s_.get("triangles", [])}
+        try:
+            det = scan["det"].result()
+        except Exception as e:  # noqa: BLE001 - surface it to the user, the selections stay theirs
+            raise HTTPException(422, f"no surfaces could be found for the unselected part of the scan: {e}") from e
+        lab = np.asarray(det["label"])
+        for i, k in det["kinds"].items():
+            t = [x for x in np.flatnonzero(lab == int(i)).tolist() if x not in used]
+            if len(t) >= 3:
+                used.update(t)
+                sel.append({"kind": k, "surface": k, "triangles": t, "params": det["params"][i], "fill": True})
     try:
-        payload = guide.labels(len(tri), body.selections)
+        payload = guide.labels(len(tri), sel)
     except (ValueError, KeyError, TypeError) as e:
         raise HTTPException(400, f"bad selections: {e}") from e
     work = Path(tempfile.mkdtemp(prefix="mesh2step_guide_"))
     labels, out = work / "labels.json", work / f"{Path(job['name']).stem}.guided.step"
     labels.write_text(json.dumps(payload))
-    cmd = [sys.executable, str(EDGEBUILD), str(job["stl"]), str(out), "--labels", str(labels)]
+    # a scan builds by cells of its surfaces (cellbuild): edgebuild's mesh-derived corners do not exist on a scan
+    cmd = [sys.executable, str(EDGEBUILD.with_name("cellbuild.py") if scan else EDGEBUILD),
+           str(scan["stl"] if scan else job["stl"]), str(out), "--labels", str(labels)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                             start_new_session=True)
     try:

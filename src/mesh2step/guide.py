@@ -310,7 +310,7 @@ def suggest(tri, kind):
 
 def labels(n, selections):
     label = [-1] * n
-    kinds = {}
+    kinds, params, fill = {}, {}, []
     seen = set()
     for i, sel in enumerate(selections):
         surface = sel.get("surface")
@@ -330,4 +330,9 @@ def labels(n, selections):
             seen.add(t)
             label[t] = i
         kinds[str(i)] = surface
-    return {"label": label, "kinds": kinds}
+        if sel.get("params"):   # the surface the user accepted; cellbuild builds it as is
+            params[str(i)] = sel["params"]
+        if sel.get("fill"):     # not the user's: labelled for them from detection, to be checked by the builder
+            fill.append(str(i))
+    return ({"label": label, "kinds": kinds} | ({"params": params} if params else {})
+            | ({"fill": fill} if fill else {}))
