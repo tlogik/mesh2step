@@ -38,7 +38,7 @@ def build(stl, out, labels=None):
     try:
         env = {**os.environ, "PYTHONPATH": str(ROOT / "src")} | ({"EB_SCAN": "1"} if labels else {})
         p = subprocess.run(cmd, cwd=ROOT / "tools/feature_recon", capture_output=True, text=True, timeout=900, env=env)
-        res = next((ln for ln in p.stdout.splitlines() if ln.startswith("RESULT ")), "")
+        res = next((ln for ln in p.stdout.splitlines() if ln.startswith(("RESULT ", "FAIL"))), p.stdout[-300:])
     except subprocess.TimeoutExpired:
         res = "timeout"
     return res, round(time.time() - t0, 1)
