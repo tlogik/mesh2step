@@ -1953,7 +1953,7 @@ def guide_build(token: str, body: BuildBody):
             t = [x for x in np.flatnonzero(lab == int(i)).tolist() if x not in used]
             if len(t) >= 3:
                 used.update(t)
-                sel.append({"kind": k, "surface": k, "triangles": t})
+                sel.append({"kind": k, "surface": k, "triangles": t, "params": det["params"][i], "fill": True})
     try:
         payload = guide.labels(len(tri), sel)
     except (ValueError, KeyError, TypeError) as e:
@@ -1961,10 +1961,11 @@ def guide_build(token: str, body: BuildBody):
     work = Path(tempfile.mkdtemp(prefix="mesh2step_guide_"))
     labels, out = work / "labels.json", work / f"{Path(job['name']).stem}.guided.step"
     labels.write_text(json.dumps(payload))
-    cmd = [sys.executable, str(EDGEBUILD), str(scan["stl"] if scan else job["stl"]), str(out),
-           "--labels", str(labels)]
+    # a scan builds by cells of its surfaces (cellbuild): edgebuild's mesh-derived corners do not exist on a scan
+    cmd = [sys.executable, str(EDGEBUILD.with_name("cellbuild.py") if scan else EDGEBUILD),
+           str(scan["stl"] if scan else job["stl"]), str(out), "--labels", str(labels)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                            start_new_session=True, env=os.environ | ({"EB_SCAN": "1"} if scan else {}))
+                            start_new_session=True)
     try:
         stdout, _ = proc.communicate(timeout=EDGEBUILD_TIMEOUT_S)
     except subprocess.TimeoutExpired:

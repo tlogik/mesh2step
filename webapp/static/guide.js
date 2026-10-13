@@ -261,7 +261,7 @@ export async function startGuide(ctx) {
         } else {
           const selSet = new Set();
           for (const s of selections) for (const t of s.triangles) selSet.add(t);
-          selections.push({ kind, surface: surfaceFor(kind, r), triangles: r.triangles.filter(t => !selSet.has(t)) });
+          selections.push({ kind, surface: surfaceFor(kind, r), triangles: r.triangles.filter(t => !selSet.has(t)), params: r.params });
           paramsEl.textContent = fmtParam(r);
         }
         recolour();
@@ -283,7 +283,7 @@ export async function startGuide(ctx) {
       const data = await resp.json();
       const selSet = new Set();
       for (const s of selections) for (const t of s.triangles) selSet.add(t);
-      selections.push({ kind, surface: data.surface || surfaceFor(kind, null), triangles: data.triangles.filter(t => !selSet.has(t)) });
+      selections.push({ kind, surface: data.surface || surfaceFor(kind, null), triangles: data.triangles.filter(t => !selSet.has(t)), params: data.params });
       paramsEl.textContent = fmtParam(data);
       recolour();
     } catch (e2) {
@@ -300,7 +300,7 @@ export async function startGuide(ctx) {
     for (const r of suggested) {
       if (!r.triangles.some(t => selSet.has(t))) {
         const tris = r.triangles.filter(t => !selSet.has(t));
-        selections.push({ kind, surface: surfaceFor(kind, r), triangles: tris });
+        selections.push({ kind, surface: surfaceFor(kind, r), triangles: tris, params: r.params });
         for (const t of tris) selSet.add(t);
       }
     }
@@ -341,7 +341,7 @@ export async function startGuide(ctx) {
       });
       const data = await resp.json();
       if (!resp.ok) { statusEl.textContent = data.detail || 'Fit failed'; return; }
-      selections.push({ kind, surface: data.surface, triangles: data.triangles });
+      selections.push({ kind, surface: data.surface, triangles: data.triangles, params: data.params });
       painted = new Set();
       statusEl.textContent = '';
       paramsEl.textContent = fmtParam(data);

@@ -1,5 +1,5 @@
 """Guided selection on a SCAN (bd projects-vgj7 P4): mesh?scan=true, the brush (POST fit), suggestions from
-scanransac.detect, and a build that fills the unselected triangles from detect under EB_SCAN.
+scanransac.detect, and a build (cellbuild) that fills the unselected triangles from detect.
 
 The scan is the synthetic plate (tests/guided_part.py) through scanbench.scanify: 10 mm hole along Z at (0, 0),
 r4 fillet axis at (26, 16), countersink at (-18, 0). The job is registered directly: the subject is the guided
@@ -85,8 +85,6 @@ def test_suggest_includes_detect(client, token, tri):
     assert any(len(set(g["triangles"]) & hole) >= 0.8 * len(hole) for g in r.json()["regions"])
 
 
-@pytest.mark.xfail(strict=True, reason="edgebuild EB_SCAN: corners where fitted surfaces do not meet (2026-10-13, "
-                   "41 on this plate; 27/30 scanbench builds). bd projects-vgj7.1: remove the mark when it lands.")
 def test_build_from_brush(client, token, tri, tmp_path):
     g = client.post(f"/api/guide/{token}/fit", json={"triangles": _paint(tri, 0, 0, 5), "kind": "cylinder"}).json()
     r = client.post(f"/api/guide/{token}/build",

@@ -79,11 +79,11 @@ def user(m, labels, truth, det, raw=None):
         inner = B.interior(labels, nb, f)
         if len(inner) < 6:
             continue
-        level, tris = "none", None
+        level, tris, prm = "none", None, None
         sugg = guide_suggestions(tri, kind, cache) + (ransac_suggestions(det, kind) if det else [])
         for s in sugg:
             if len(set(s["triangles"]) & set(T.tolist())) >= 0.8 * len(T) and right(kind, s["params"], s["key"], val):
-                level, tris = "suggest", s["triangles"]
+                level, tris, prm = "suggest", s["triangles"], s["params"]
                 break
         if level == "none":
             c = tri[T].mean(1)
@@ -93,7 +93,7 @@ def user(m, labels, truth, det, raw=None):
                 st = set(g["triangles"])
                 if len(st & set(T.tolist())) / len(st | set(T.tolist())) >= 0.5 and right(
                         kind, g["params"], GUIDE_KEY[kind], val):
-                    level, tris = "click", g["triangles"]
+                    level, tris, prm = "click", g["triangles"], g["params"]
             except ValueError:
                 pass
         if level == "none":
@@ -102,10 +102,10 @@ def user(m, labels, truth, det, raw=None):
             except Exception:  # noqa: BLE001 - a failing fit is "the brush did not get it"
                 r = None
             if r is not None and right(kind, r, B.KEY[kind], val):
-                level, tris = "brush", T.tolist()
+                level, tris, prm = "brush", T.tolist(), r
         rows.append({"face": f, "kind": kind, "val": val, "level": level})
         if tris:
-            picks.append({"kind": kind, "surface": kind, "triangles": tris})
+            picks.append({"kind": kind, "surface": kind, "triangles": tris, "params": prm})
     return rows, picks
 
 
@@ -123,7 +123,7 @@ def build_labels(n, picks, det):
             t = [x for x in np.flatnonzero(lab == i).tolist() if x not in used]
             if len(t) >= 3:
                 used.update(t)
-                sel.append({"kind": k, "surface": k, "triangles": t})
+                sel.append({"kind": k, "surface": k, "triangles": t, "params": det["params"][i], "fill": True})
     return guide.labels(n, sel)
 
 
