@@ -449,14 +449,21 @@ def _circle2d(Q):
     return c, float(np.sqrt(max(sol[2] + c @ c, 0.0)))
 
 
-def fit(mesh, triangles, kind):
+def fit(mesh, triangles, kind, raw=None):
     """The user's brush: the least-squares `kind` surface of the painted triangles, no acceptance gate (the user named
     the kind). Initial guesses come from the facet NORMALS (normal lines meet at a sphere centre / a cylinder axis,
     tangent planes at a cone apex, all normal lines meet a torus axis), which stay well posed on a narrow arc where
-    the vertex-only algebraic fits are not; then _refine on the vertices."""
+    the vertex-only algebraic fits are not; then _refine on the vertices.
+    raw: the scan before scanprep. The user paints on the clean mesh, the fit uses the raw triangles under the paint:
+    smoothing biases radii, least squares averages noise (measured 2026-10-13, scanbench 30 parts: brush on the raw
+    scan 106/146 faces right, on the prepped one 72/137)."""
     if kind not in KINDS_ORDER:
         raise ValueError(f"unknown kind {kind!r}")
     t = np.asarray(triangles, int)
+    if raw is not None:
+        edge = float(mesh.edges_unique_length.mean())
+        near = cKDTree(mesh.triangles_center[t]).query(raw.triangles_center, distance_upper_bound=edge)[0]
+        t, mesh = np.flatnonzero(np.isfinite(near)), raw
     V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces)
     P = V[np.unique(F[t])]
     X, N, w = mesh.triangles_center[t], mesh.face_normals[t], mesh.area_faces[t]

@@ -45,11 +45,11 @@ def right(kind, prm, key, val):
     return abs(got - abs(val)) <= (50 * RTOL if kind == "cone" else RTOL * abs(val))
 
 
-def brush(m, inner, kind):
-    """The user paints the face's interior and names the kind: scanransac.fit (P4)."""
+def brush(m, inner, kind, raw=None):
+    """The user paints the face's interior and names the kind: scanransac.fit (P4), on the raw scan under the paint."""
     from scanransac import fit
 
-    return fit(m, inner, kind)
+    return fit(m, inner, kind, raw)
 
 
 def ransac_suggestions(det, kind):
@@ -67,7 +67,7 @@ def guide_suggestions(tri, kind, cache):
     return cache[kind]
 
 
-def user(m, labels, truth, det):
+def user(m, labels, truth, det, raw=None):
     """Per true curved face: the cheapest level that gets it right, and the triangles the user ends with."""
     tri = np.asarray(m.triangles)
     nb = B.R.mesh_topology(tri)[2]
@@ -98,7 +98,7 @@ def user(m, labels, truth, det):
                 pass
         if level == "none":
             try:
-                r = brush(m, inner, kind)
+                r = brush(m, inner, kind, raw)
             except Exception:  # noqa: BLE001 - a failing fit is "the brush did not get it"
                 r = None
             if r is not None and right(kind, r, B.KEY[kind], val):
@@ -140,7 +140,7 @@ def run_part(part, build=True, rtol=RTOL):
     for variant, m in (("noisy", noisy), ("prep", pm), ("ransac", pm)):
         labels = B.transfer(clean, owner, m)
         det = detect(m) if variant == "ransac" else None
-        rows, picks = user(m, labels, truth, det)
+        rows, picks = user(m, labels, truth, det, None if m is noisy else noisy)
         res = {"faces": rows}
         if build and det:  # without detection the unselected triangles (planes) have no label: never builds
             with tempfile.TemporaryDirectory() as td:
