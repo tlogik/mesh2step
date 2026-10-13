@@ -10,6 +10,7 @@ dependencies = [
     "numpy",
     "trimesh",
     "cadquery-ocp",
+    "pymeshlab>=2025.7",  # scan preprocessing: isotropic remeshing + feature-preserving smoothing
 ]
 
 [project.scripts]
