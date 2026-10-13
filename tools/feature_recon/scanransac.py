@@ -376,6 +376,238 @@ def _component(fa, inlier_idx, seed, nf):
     return inlier_idx[comp_local]
 
 
+def _fit_plane(Vc):
+    c = Vc.mean(0)
+    _, _, Vt = np.linalg.svd(Vc - c, full_matrices=False)
+    n = Vt[-1]
+    d = n @ c
+    return np.array([n[0], n[1], n[2], d])
+
+
+def _fit_sphere(Vc):
+    A = np.column_stack([Vc, np.ones(len(Vc))])
+    b = np.sum(Vc ** 2, axis=1)
+    sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    c = sol[:3] / 2
+    r2 = sol[3] + np.sum(c ** 2)
+    r = np.sqrt(max(r2, 0.0))
+    return np.array([c[0], c[1], c[2], r])
+
+
+def _fit_cylinder(Vc, Nc):
+    S = np.zeros((3, 3))
+    for n in Nc:
+        S += np.outer(n, n)
+    eigvals, eigvecs = np.linalg.eigh(S)
+    a = eigvecs[:, 0]
+    c = Vc.mean(0)
+    v_proj = Vc - ((Vc - c) @ a)[:, None] * a
+    ref = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(a, ref)
+    u /= np.linalg.norm(u)
+    v = np.cross(a, u)
+    x2d = v_proj @ u
+    y2d = v_proj @ v
+    A = np.column_stack([x2d, y2d, np.ones(len(x2d))])
+    b = x2d ** 2 + y2d ** 2
+    sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    cx2d = sol[0] / 2
+    cy2d = sol[1] / 2
+    r2 = sol[2] + cx2d ** 2 + cy2d ** 2
+    r = np.sqrt(max(r2, 0.0))
+    p = c + cx2d * u + cy2d * v
+    return np.array([a[0], a[1], a[2], p[0], p[1], p[2], r])
+
+
+def _from_params(kind, p):
+    if kind == "plane":
+        return np.array([p["normal"][0], p["normal"][1], p["normal"][2], p["d"]])
+    if kind == "cylinder":
+        return np.array([p["axis"][0], p["axis"][1], p["axis"][2],
+                         p["point"][0], p["point"][1], p["point"][2], p["radius"]])
+    if kind == "sphere":
+        return np.array([p["center"][0], p["center"][1], p["center"][2], p["radius"]])
+    if kind == "cone":
+        return np.array([p["apex"][0], p["apex"][1], p["apex"][2],
+                         p["axis"][0], p["axis"][1], p["axis"][2], np.deg2rad(p["angle"])])
+    if kind == "torus":
+        return np.array([p["center"][0], p["center"][1], p["center"][2],
+                         p["axis"][0], p["axis"][1], p["axis"][2], p["major"], p["minor"]])
+    raise ValueError(kind)
+
+
+def _select_kind(Vc, Nc, ransac_kind, ransac_x, eps, diag):
+    max_idx = COMPLEXITY[ransac_kind]
+    kinds_to_try = [k for k in KINDS_ORDER if COMPLEXITY[k] <= max_idx]
+    results = {}
+    for kind in kinds_to_try:
+        if kind == "plane":
+            x0 = _fit_plane(Vc)
+        elif kind == "sphere":
+            x0 = _fit_sphere(Vc)
+        elif kind == "cylinder":
+            x0 = _fit_cylinder(Vc, Nc)
+        elif kind in ("cone", "torus"):
+            x0 = ransac_x
+        else:
+            continue
+        x_ref = _refine(kind, x0, Vc, eps)
+        d, _ = DIST[kind](x_ref, Vc)
+        rms = float(np.sqrt(np.mean(d ** 2)))
+        results[kind] = (x_ref, rms)
+    best_rms = min(rms for _, rms in results.values())
+    chosen_kind = None
+    chosen_x = None
+    for kind in KINDS_ORDER:
+        if kind not in results:
+            continue
+        x, rms = results[kind]
+        if rms <= 1.5 * best_rms and rms <= eps:
+            chosen_kind = kind
+            chosen_x = x
+            break
+    if chosen_kind is None:
+        chosen_kind = min(results, key=lambda k: results[k][1])
+        chosen_x = results[chosen_kind][0]
+    if chosen_kind in ("sphere", "cylinder") and chosen_x[-1] > diag:
+        x0 = _fit_plane(Vc)
+        return "plane", _refine("plane", x0, Vc, eps)
+    if chosen_kind == "cone":
+        t = chosen_x[6]
+        if t > np.deg2rad(80):
+            x0 = _fit_plane(Vc)
+            return "plane", _refine("plane", x0, Vc, eps)
+        if t < np.deg2rad(3):
+            x0 = _fit_cylinder(Vc, Nc)
+            return "cylinder", _refine("cylinder", x0, Vc, eps)
+    return chosen_kind, chosen_x
+
+
+def _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag):
+    nf = len(F)
+    if fa.size == 0:
+        return label, kinds, params
+
+    def _get_face_sets():
+        active = set(label[label >= 0].tolist())
+        return {rid: np.where(label == rid)[0] for rid in active}
+
+    def _rms_for(kind, x, verts):
+        d, _ = DIST[kind](x, verts)
+        return float(np.sqrt(np.mean(d ** 2)))
+
+    merged = True
+    while merged:
+        merged = False
+        face_sets = _get_face_sets()
+        if len(face_sets) < 2:
+            break
+        r0 = label[fa[:, 0]]
+        r1 = label[fa[:, 1]]
+        adj_mask = (r0 != r1) & (r0 >= 0) & (r1 >= 0)
+        if not adj_mask.any():
+            break
+        adj_pairs = np.unique(np.column_stack([r0[adj_mask], r1[adj_mask]]), axis=0)
+        for pair in adj_pairs:
+            a, b = int(pair[0]), int(pair[1])
+            if a not in face_sets or b not in face_sets:
+                continue
+            kind_a = kinds.get(a)
+            kind_b = kinds.get(b)
+            if kind_a is None or kind_b is None:
+                continue
+            larger = a if len(face_sets[a]) >= len(face_sets[b]) else b
+            smaller = b if larger == a else a
+            candidate_kinds = []
+            if kind_a == kind_b:
+                candidate_kinds = [kind_a]
+            else:
+                candidate_kinds = [kinds[larger]]
+                if kind_a in ("cone", "cylinder") or kind_b in ("cone", "cylinder"):
+                    if "cylinder" not in candidate_kinds:
+                        candidate_kinds.append("cylinder")
+            verts_a = V[np.unique(F[face_sets[a]])]
+            verts_b = V[np.unique(F[face_sets[b]])]
+            verts_union = np.vstack([verts_a, verts_b])
+            normals_union = np.vstack([N[face_sets[a]], N[face_sets[b]]])
+            x_a = _from_params(kind_a, params[a])
+            x_b = _from_params(kind_b, params[b])
+            rms_a = _rms_for(kind_a, x_a, verts_a)
+            rms_b = _rms_for(kind_b, x_b, verts_b)
+            for ck in candidate_kinds:
+                if kinds[larger] == ck:
+                    x0 = _from_params(ck, params[larger])
+                elif ck == "plane":
+                    x0 = _fit_plane(verts_union)
+                elif ck == "sphere":
+                    x0 = _fit_sphere(verts_union)
+                elif ck == "cylinder":
+                    x0 = _fit_cylinder(verts_union, normals_union)
+                else:
+                    src = a if kinds.get(a) == ck else b
+                    x0 = _from_params(ck, params[src])
+                x_ref = _refine(ck, x0, verts_union, eps)
+                d, _ = DIST[ck](x_ref, verts_union)
+                rms_union = float(np.sqrt(np.mean(d ** 2)))
+                if rms_union <= 1.5 * max(rms_a, rms_b) and rms_union <= eps:
+                    label[face_sets[smaller]] = larger
+                    kinds[larger] = ck
+                    params[larger] = _to_params(ck, x_ref)
+                    del kinds[smaller]
+                    del params[smaller]
+                    merged = True
+                    break
+            if merged:
+                break
+    old_ids = sorted(set(label[label >= 0].tolist()))
+    if not old_ids:
+        return label, {}, {}
+    mapping = {old: new for new, old in enumerate(old_ids)}
+    new_label = np.array([mapping.get(int(l), -1) for l in label], dtype=int)
+    new_kinds = {mapping[old]: kinds[old] for old in old_ids}
+    new_params = {mapping[old]: params[old] for old in old_ids}
+    return new_label, new_kinds, new_params
+
+
+def _fill_gaps(label, kinds, params, C, fa):
+    nf = len(label)
+    if fa.size == 0:
+        return label
+    unlabelled = np.where(label == -1)[0]
+    if len(unlabelled) == 0:
+        return label
+    adj = [[] for _ in range(nf)]
+    for a, b in fa:
+        adj[int(a)].append(int(b))
+        adj[int(b)].append(int(a))
+    changed = True
+    while changed:
+        changed = False
+        unlabelled = np.where(label == -1)[0]
+        if len(unlabelled) == 0:
+            break
+        for f in unlabelled:
+            candidates = set()
+            for nb in adj[f]:
+                if label[nb] >= 0:
+                    candidates.add(int(label[nb]))
+            if not candidates:
+                continue
+            best_rid = None
+            best_dist = np.inf
+            for rid in candidates:
+                kind = kinds[rid]
+                x = _from_params(kind, params[rid])
+                d, _ = DIST[kind](x, C[f:f + 1])
+                dist = abs(float(d[0]))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_rid = rid
+            label[f] = best_rid
+            changed = True
+    return label
+
+
 def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
     # an STL loads as a triangle soup: no shared vertices, no adjacency, every component one triangle.
     # merge_vertices keeps the faces (and so the label order) as they are
@@ -588,14 +820,21 @@ def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
                 break
             continue
 
-        # Degenerate check
+        # Kind selection
         Vc = V[np.unique(F[best_comp])]
-        best_kind, x_ref = _degenerate(best_kind, x_ref, diag, Vc)
+        Nc = N[best_comp]
+        best_kind, x_ref = _select_kind(Vc, Nc, best_kind, x_ref, eps, diag)
 
         # Assign
         label[best_comp] = next_id
         kinds[next_id] = best_kind
         params[next_id] = _to_params(best_kind, x_ref)
         next_id += 1
+
+    # Merge fragments
+    label, kinds, params = _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag)
+
+    # Fill gaps
+    label = _fill_gaps(label, kinds, params, C, fa)
 
     return {"label": label, "kinds": kinds, "params": params}
