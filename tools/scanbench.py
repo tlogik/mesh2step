@@ -130,6 +130,44 @@ def score_mesh(mesh, labels, truth):
     return rows
 
 
+KEY = {"cylinder": "radius", "sphere": "radius", "cone": "angle", "torus": "minor"}  # detected param per kind
+
+
+def score_detect(mesh, labels, truth, det):
+    """Primitive detection without truth labels (scan P2): a true curved face counts when one detected region
+    covers at least half of its interior triangles (the same interior score_mesh fits) with the true kind and
+    parameter (radius 2 %, cone angle 1 deg, torus minor radius 2 %). det: {"label", "kinds", "params"};
+    det["kinds"] None scores kind and coverage only (the regions() baseline has no per-region parameters)."""
+    tri = np.asarray(mesh.triangles)
+    nb = R.mesh_topology(tri)[2]
+    dl = np.asarray(det["label"])
+    rows = []
+    for f, (kind, val) in truth.items():
+        if kind not in CURVED:
+            continue
+        ts = interior(labels, nb, f)
+        if len(ts) < 6:
+            rows.append({"face": f, "kind": kind, "n": len(ts), "ok": None})
+            continue
+        ids, cnt = np.unique(dl[ts], return_counts=True)
+        cnt[ids < 0] = 0
+        d = int(ids[np.argmax(cnt)])
+        got = det["kinds"].get(d) if d >= 0 else None
+        ok = bool(cnt.max() >= 0.5 * len(ts)) and got == kind
+        prm = (det.get("params") or {}).get(d)
+        if ok and prm is not None:
+            ok = matches((kind, (0, prm["minor"]) if kind == "torus" else prm[KEY[kind]]), kind, val)
+        rows.append({"face": f, "kind": kind, "n": len(ts), "ok": ok, "got": got,
+                     "cover": round(float(cnt.max() / len(ts)), 3)})
+    return rows
+
+
+def regions_detect(mesh):
+    """The deterministic engine's own segmentation (regions.regions), in detect() form, as the P2 baseline."""
+    r = R.regions(np.asarray(mesh.triangles))
+    return {"label": np.asarray(r["label"]), "kinds": dict(enumerate(r["kinds"])), "params": None}
+
+
 def sharp_points(clean, owner, step):
     """Points every `step` along the CAD's sharp edges (dihedral > 30 deg between two different
     B-rep faces)."""
@@ -180,7 +218,7 @@ def geometry(clean, owner, mesh, n=4000, seed=0):
     }
 
 
-def score_part(part, variant, seed=0):
+def score_part(part, variant, seed=0, detect=None):
     clean, fidx, truth = load(part)
     if variant == "clean":
         mesh, labels = clean, fidx
@@ -191,6 +229,18 @@ def score_part(part, variant, seed=0):
 
             mesh, _ = prep(mesh)
         labels = transfer(clean, fidx, mesh, seed=seed)
+    if detect:
+        import time
+
+        t0 = time.time()
+        if detect == "ransac":
+            from scanransac import detect as run
+
+            det = run(mesh)
+        else:
+            det = regions_detect(mesh)
+        return {"part": part, "variant": variant, "tris": len(mesh.faces), "detect": detect,
+                "seconds": round(time.time() - t0, 1), "faces": score_detect(mesh, labels, truth, det)}
     return {
         "part": part,
         "variant": variant,
@@ -248,13 +298,14 @@ def main():
     s.add_argument("--variant", choices=("clean", "uniform", "noisy", "prep"), required=True)
     s.add_argument("--parts", default=str(ROOT / "tools/scanbench_parts.json"))
     s.add_argument("--limit", type=int)
+    s.add_argument("--detect", choices=("ransac", "regions"), help="score detection (P2) instead of fitting")
     s.add_argument("--out")
     a = ap.parse_args()
     if a.cmd == "pick":
         print(json.dumps(pick(a.n), indent=1))
         return
     parts = json.loads(Path(a.parts).read_text())[: a.limit]
-    results = [score_part(p, a.variant) for p in parts]
+    results = [score_part(p, a.variant, detect=a.detect) for p in parts]
     if a.out:
         Path(a.out).write_text(json.dumps(results))
     print(json.dumps(summary(results)))
