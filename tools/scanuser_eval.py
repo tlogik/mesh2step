@@ -8,10 +8,11 @@ every true curved face (>= 6 interior triangles, as scanbench) is scored by the 
 its kind and parameter right (radius 2 %, cone 1 deg, torus minor radius 2 %):
   suggest  a suggested region covering >= 80 % of the face (0 clicks)
   click    guide.grow from the face's centre triangle: IoU >= 0.5 with the face (1 click)
-  brush    the user paints the face's interior, guide's own fit of those triangles (P4's subject)
+  brush    the user paints the face's interior and names the kind: scanransac.fit of those triangles (P4)
   none     the stack gives the user no way to get it
-Then the build from what the user got (edgebuild --labels, EB_SCAN=1); in the ransac variant the rest of the
-part (planes) comes from scanransac too. Build validity and analytic faces recovered (guide_eval.check_recovery).
+Then, in the ransac variant only, the build from what the user got plus scanransac's regions for the rest of the
+part (planes) (edgebuild --labels, EB_SCAN=1); without them unselected triangles have no label and nothing builds.
+Build validity and analytic faces recovered (guide_eval.check_recovery).
 
 usage: python3 tools/scanuser_eval.py [--limit N] [--jobs 4] [--no-build] --out results.json   (under watchjob)
 """
@@ -42,6 +43,13 @@ def right(kind, prm, key, val):
         return False
     got = abs(float(prm[key]))
     return abs(got - abs(val)) <= (50 * RTOL if kind == "cone" else RTOL * abs(val))
+
+
+def brush(m, inner, kind):
+    """The user paints the face's interior and names the kind: scanransac.fit (P4)."""
+    from scanransac import fit
+
+    return fit(m, inner, kind)
 
 
 def ransac_suggestions(det, kind):
@@ -89,10 +97,11 @@ def user(m, labels, truth, det):
             except ValueError:
                 pass
         if level == "none":
-            V, F, _nb, diag = B.R.mesh_topology(tri)
-            n, area = guide._normals(tri)
-            r = guide._try_fit(inner, V, F, n, area, 3e-4 * diag, kind)
-            if r is not None and right(kind, r[2], GUIDE_KEY[kind], val):
+            try:
+                r = brush(m, inner, kind)
+            except Exception:  # noqa: BLE001 - a failing fit is "the brush did not get it"
+                r = None
+            if r is not None and right(kind, r, B.KEY[kind], val):
                 level, tris = "brush", T.tolist()
         rows.append({"face": f, "kind": kind, "val": val, "level": level})
         if tris:
@@ -133,7 +142,7 @@ def run_part(part, build=True, rtol=RTOL):
         det = detect(m) if variant == "ransac" else None
         rows, picks = user(m, labels, truth, det)
         res = {"faces": rows}
-        if build:
+        if build and det:  # without detection the unselected triangles (planes) have no label: never builds
             with tempfile.TemporaryDirectory() as td:
                 stl, lab, step = Path(td) / "s.stl", Path(td) / "l.json", Path(td) / "o.step"
                 m.export(stl)

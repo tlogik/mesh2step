@@ -436,6 +436,73 @@ def _from_params(kind, p):
     raise ValueError(kind)
 
 
+def _nearest_to_lines(X, D, w):
+    """Weighted least-squares point nearest the lines X_i + t D_i (D unit)."""
+    P_ = np.eye(3)[None] - D[:, :, None] * D[:, None, :]
+    return np.linalg.lstsq(np.einsum("i,ijk->jk", w, P_), np.einsum("i,ijk,ik->j", w, P_, X), rcond=None)[0]
+
+
+def _circle2d(Q):
+    """Algebraic circle fit of 2D points: (centre, radius)."""
+    sol = np.linalg.lstsq(np.c_[Q, np.ones(len(Q))], (Q ** 2).sum(1), rcond=None)[0]
+    c = sol[:2] / 2
+    return c, float(np.sqrt(max(sol[2] + c @ c, 0.0)))
+
+
+def fit(mesh, triangles, kind):
+    """The user's brush: the least-squares `kind` surface of the painted triangles, no acceptance gate (the user named
+    the kind). Initial guesses come from the facet NORMALS (normal lines meet at a sphere centre / a cylinder axis,
+    tangent planes at a cone apex, all normal lines meet a torus axis), which stay well posed on a narrow arc where
+    the vertex-only algebraic fits are not; then _refine on the vertices."""
+    if kind not in KINDS_ORDER:
+        raise ValueError(f"unknown kind {kind!r}")
+    t = np.asarray(triangles, int)
+    V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces)
+    P = V[np.unique(F[t])]
+    X, N, w = mesh.triangles_center[t], mesh.face_normals[t], mesh.area_faces[t]
+    eps = max(3 * _noise(V, F), 5e-4 * float(np.linalg.norm(mesh.extents)))
+    if kind == "plane":
+        x0 = _fit_plane(P)
+    elif kind == "sphere":
+        c = _nearest_to_lines(X, N, w)
+        x0 = np.r_[c, np.median(np.linalg.norm(P - c, axis=1))]
+    elif kind == "cylinder":
+        a = np.linalg.eigh(np.einsum("i,ij,ik->jk", w, N, N))[1][:, 0]
+        M = N - np.outer(N @ a, a)
+        M /= np.maximum(np.linalg.norm(M, axis=1, keepdims=True), 1e-12)
+        p = _nearest_to_lines(X, M, w)  # normals projected across the axis meet on it (along it: the patch's mean)
+        q = P - p
+        x0 = np.r_[a, p, np.median(np.linalg.norm(q - np.outer(q @ a, a), axis=1))]
+    elif kind == "cone":
+        apex = np.linalg.lstsq(np.einsum("i,ij,ik->jk", w, N, N), np.einsum("i,ij,i->j", w, N, (N * X).sum(1)),
+                               rcond=None)[0]
+        best = None
+        for a in np.linalg.eigh(np.cov(N.T, aweights=w))[1][:, :2].T:
+            q = P - apex
+            h = q @ a
+            if h.mean() < 0:
+                a, h = -a, -h
+            rho = np.linalg.norm(q - np.outer(h, a), axis=1)
+            k = np.polyfit(h, rho, 1)
+            res = float(np.abs(np.polyval(k, h) - rho).mean())
+            if best is None or res < best[0]:
+                best = (res, a, k)
+        x0 = np.r_[apex, best[1], np.arctan(max(best[2][0], 1e-3))]
+    else:  # torus: the axis is the line every normal line meets (Pottmann and Randrup 1998)
+        L = np.c_[np.cross(X, N), N]
+        e = np.linalg.eigh((L * w[:, None]).T @ L)[1][:, 0]
+        na = np.linalg.norm(e[3:])
+        ax, abar = e[3:] / na, e[:3] / na
+        c = np.cross(ax, abar)
+        q = P - c
+        h = q @ ax
+        (h0, rho0), r = _circle2d(np.c_[h, np.linalg.norm(q - np.outer(h, ax), axis=1)])
+        x0 = np.r_[c + h0 * ax, ax, rho0, r]
+    x = _refine(kind, np.asarray(x0, float), P, eps)
+    d, _ = DIST[kind](x, P)
+    return _to_params(kind, x) | {"kind": kind, "rms": float(np.sqrt(np.mean(d ** 2)))}
+
+
 def _select_kind(Vc, Nc, ransac_kind, ransac_x, eps, diag):
     max_idx = COMPLEXITY[ransac_kind]
     kinds_to_try = [k for k in KINDS_ORDER if COMPLEXITY[k] <= max_idx]
