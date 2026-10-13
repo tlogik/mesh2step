@@ -67,6 +67,7 @@ def fail(msg):
 SCANPREP = "--scanprep" in sys.argv   # scanned input: denoise first (scanprep.py)
 if SCANPREP:
     sys.argv.remove("--scanprep")
+SCAN = SCANPREP or bool(os.environ.get("EB_SCAN"))   # scanned input: region tests tolerate blurred edges
 USER_LABELS = None
 if "--labels" in sys.argv:
     i_ = sys.argv.index("--labels")
@@ -421,7 +422,10 @@ for L in list(S):
     Pv_f = V[np.unique(F[ts])]; c_f = Pv_f.mean(0); n_f = np.linalg.svd(Pv_f - c_f)[2][-1]
     flat_ = len(Pv_f) >= 3 and float(np.abs((Pv_f - c_f) @ n_f).max()) < 1e-6 * diag
     if (not flat_ and np.abs(sdist(s, cen_)).max() < 5e-3 * diag and all(0 < z_ < diag for z_ in sizes_)
-            and np.abs(np.einsum("ij,ij->i", g_, nt[ts])).min() > math.cos(math.radians(20))):
+            and (SCAN or np.abs(np.einsum("ij,ij->i", g_, nt[ts])).min() > math.cos(math.radians(20)))):
+        # EB_SCAN: no facing test. A scan blurs every edge over a triangle, so rim triangles of a true face face its
+        # neighbour (CAD-truth labels, 2026-10-13: a 0.48 mm hole worst 89.6 deg, its 10th percentile still > 20 deg);
+        # splitting it made 265 one-triangle planes whose corners cannot meet. The distance test still applies.
         continue
     if os.environ.get("EB_DUMP_TRIS") and str(L) in os.environ["EB_DUMP_TRIS"].split(","):
         # what a rejected curved region is made of: facet normal directions and where its triangles sit
