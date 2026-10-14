@@ -173,3 +173,50 @@ def test_scan_brush_fillet(live_url, tmp_path):
         assert len(page.evaluate("() => window.__guide.selections")) == 1
         assert errors == [], errors
         b.close()
+
+
+def test_scan_declared_at_upload(live_url, tmp_path):
+    """bd projects-vgj7.3: the scan box at upload skips the CAD conversion and lands in scan mode in seconds."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+    import time
+
+    import scanbench as B
+
+    mesh = G.tessellate(G.part())[0]
+    mesh.merge_vertices()
+    stl = tmp_path / "plate_scan.stl"
+    B.scanify(mesh).export(str(stl))
+    with playwright_api.sync_playwright() as pw:
+        b = pw.chromium.launch(args=["--use-gl=swiftshader", "--enable-unsafe-swiftshader"])
+        page = b.new_page(viewport={"width": 1280, "height": 900})
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(live_url, wait_until="networkidle", timeout=60000)
+        page.evaluate("document.getElementById('welcome-overlay').classList.add('hidden')")
+        page.set_input_files("#file-input", str(stl))
+        page.wait_for_timeout(1500)
+        page.check("#scan-toggle")
+        t = time.time()
+        page.click("#convert-btn")
+        page.wait_for_function("() => window.__guide && window.__guide.mesh && window.__guide.mesh.length > 0",
+                               timeout=120000)
+        assert time.time() - t < 60, "the guided step must open in seconds on a declared scan"
+        assert page.inner_text("#guide-scan") == "3D scan mode"
+        assert "Cylinder" in page.inner_text("#guide-step-title")
+
+        stroke = page.evaluate(FILLET_STROKE_JS)
+        assert len(stroke) >= 4, stroke
+        pts = [page.evaluate("(t) => window.__guide.project(t)", t) for t in stroke]
+        page.click("#guide-brush")
+        page.mouse.move(pts[0]["x"], pts[0]["y"])
+        page.mouse.down()
+        for p in pts[1:]:
+            page.mouse.move(p["x"], p["y"], steps=4)
+        page.mouse.up()
+        page.click("#guide-fit")
+        page.wait_for_function("() => /radius/.test(document.getElementById('guide-params').textContent)",
+                               timeout=60000)
+        txt = page.inner_text("#guide-params")
+        assert any(f"radius {r} mm" in txt for r in ("3.9", "4.0", "4.1")), txt
+        assert errors == [], errors
+        b.close()

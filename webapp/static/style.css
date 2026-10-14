@@ -401,3 +401,4 @@ select {
 .work-time { font-size: 12px; color: var(--text-muted); margin: 0 0 14px; }
 .work-modal .secondary-btn { width: 100%; }
 .convert-status.busy { cursor: pointer; }
+.scan-toggle { margin: 8px 0 4px; }

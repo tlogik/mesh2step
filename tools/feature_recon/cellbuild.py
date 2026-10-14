@@ -209,6 +209,36 @@ def cells(faces, lo, hi, fuzzy):
     return out
 
 
+def _closed_mesh(s, defl):
+    """The cell tessellated (BRepMesh) as a closed trimesh, or None when it does not close."""
+    from OCP.BRep import BRep_Tool
+    from OCP.BRepMesh import BRepMesh_IncrementalMesh
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.TopoDS import TopoDS
+
+    BRepMesh_IncrementalMesh(s, defl, False, 0.5, True)
+    pos, ex = [], TopExp_Explorer(s, TopAbs_FACE)
+    while ex.More():
+        f = TopoDS.Face_s(ex.Current())
+        ex.Next()
+        loc = TopLoc_Location()
+        tri = BRep_Tool.Triangulation_s(f, loc)
+        if tri is None:
+            return None
+        tr = loc.Transformation()
+        nodes = np.array([tri.Node(i).Transformed(tr).Coord() for i in range(1, tri.NbNodes() + 1)])
+        t = np.array([tri.Triangle(i).Get() for i in range(1, tri.NbTriangles() + 1)]) - 1
+        pos.append(nodes[t[:, ::-1] if f.Orientation() == TopAbs_REVERSED else t])
+    if not pos:
+        return None
+    v = np.concatenate(pos).reshape(-1, 3)
+    m = trimesh.Trimesh(v, np.arange(len(v)).reshape(-1, 3), process=False)
+    m.merge_vertices()
+    return m if m.is_watertight else None
+
+
 def inside_cells(solids, mesh, rng, tol):
     """The cells whose interior lies inside the scan, by majority of SAMPLES interior points."""
     from OCP.Bnd import Bnd_Box
@@ -231,6 +261,14 @@ def inside_cells(solids, mesh, rng, tol):
         cls = BRepClass3d_SolidClassifier(s)
         c = g.CentreOfMass()
         cand = np.r_[[[c.X(), c.Y(), c.Z()]], rng.uniform([x0, y0, z0], [x1, y1, z1], (40 * SAMPLES, 3))]
+        # the exact classifier costs ~0.3 s a point on toroidal cells and thin cells needed all 480 tries: 165 of
+        # 169 s on part 91297 (bd projects-vgj7.2). The tessellated cell screens every candidate in one call; the
+        # exact test below still decides, candidates the screen rejected come last
+        cm = _closed_mesh(s, 2e-3 * float(np.linalg.norm([x1 - x0, y1 - y0, z1 - z0])))
+        if cm is not None:
+            hit = cm.contains(cand)
+            # a thin cell: the screen's hits plus SAMPLES more, not all 480 (the screen errs only at the boundary)
+            cand = np.r_[cand[hit], cand[~hit]][: int(hit.sum()) + SAMPLES]
         pts = []
         for q in cand:
             cls.Perform(gp_Pnt(*map(float, q)), tol)

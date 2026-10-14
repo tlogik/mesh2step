@@ -19,6 +19,7 @@ usage: python3 tools/scanuser_eval.py [--limit N] [--jobs 4] [--no-build] --out 
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
@@ -59,6 +60,8 @@ def ransac_suggestions(det, kind):
 
 
 def guide_suggestions(tri, kind, cache):
+    if os.environ.get("SCANEVAL_NO_GUIDE") == "1":   # the server's scan mode suggests detect regions only (vgj7.2)
+        return []
     if kind not in cache:
         try:
             cache[kind] = [dict(s, key=GUIDE_KEY[kind]) for s in guide.suggest(tri, kind)]

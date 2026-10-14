@@ -822,7 +822,7 @@ def _edgebuild_apply(built, out_path, res) -> dict:
 def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
                        schema, native_unify, merge_coplanar_angle, filename, stem,
                        n_in_tris, cut_before, cut_after, repair_info, feature=False,
-                       feature_only=False, decimate_info=None, progress=None, recon=False) -> dict:
+                       feature_only=False, decimate_info=None, progress=None, recon=False, scan=False) -> dict:
     """The part that takes minutes. Runs on a worker so the request can let go.
 
     Bounded by _CONVERT_SLOTS: measured on this host a 64k-triangle gate needs 91s
@@ -842,6 +842,13 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             "Please try again in a minute — your file was not kept."
         )
     t_convert = time.time()
+    if scan:
+        try:
+            return _scan_upload(stl_path=stl_path, out_path=out_path, workdir=workdir, stem=stem,
+                                filename=filename, n_in_tris=n_in_tris, progress=progress)
+        finally:
+            _CONVERT_SLOTS.release()
+            observe_convert_seconds(time.time() - t_convert)
     try:
         # before anything names itself -- and on the feature-only path, where there is no engine
         # stage at all -- a poll must still get an answer, or the first seconds show nothing
@@ -1404,6 +1411,7 @@ def convert(
     feature: bool = Form(False),
     decimate: str | None = Form(None),
     decimate_keep: float = Form(0.25),
+    scan: bool = Form(False),
 ):
     _purge_expired()
 
@@ -1525,8 +1533,9 @@ def convert(
         # feature path fits primitives straight from the mesh at a fifth of the memory. Admit
         # those up to FEATURE_MAX_TRIANGLES and let the worker skip the engine entirely.
         feature_on = bool(feature) or os.environ.get("MESH2STEP_FEATURE") == "1"
-        feature_only = n_in_tris > MAX_INPUT_TRIANGLES and feature_on
-        _ceiling = FEATURE_MAX_TRIANGLES if feature_on else MAX_INPUT_TRIANGLES
+        feature_only = n_in_tris > MAX_INPUT_TRIANGLES and feature_on and not scan
+        # a scan never reaches the engine: scanprep remeshes it, so the engine's ceiling does not apply
+        _ceiling = FEATURE_MAX_TRIANGLES if feature_on or scan else MAX_INPUT_TRIANGLES
         if n_in_tris > _ceiling:
             __import__("shutil").rmtree(workdir, ignore_errors=True)
             raise HTTPException(413, (
@@ -1552,7 +1561,7 @@ def convert(
             merge_coplanar_angle=merge_coplanar_angle, filename=file.filename, stem=stem,
             n_in_tris=n_in_tris, cut_before=cut_before, cut_after=cut_after,
             repair_info=repair_info, feature=feature, feature_only=feature_only,
-            decimate_info=decimate_info, recon=_recon_allowed(request),
+            decimate_info=decimate_info, recon=_recon_allowed(request), scan=scan,
         )
         handed_off = True  # the worker owns the admission slot from here on
         try:
@@ -1812,17 +1821,61 @@ def _scan(job):
         pm.export(stl)
         from scanransac import detect
 
-        job["scan"] = {"raw": raw, "prep": pm, "stl": stl, "noise": _noise(raw.vertices, raw.faces),
-                       "det": _SCAN_POOL.submit(detect, pm)}
+        prog = stl.with_suffix(".det.pkl")      # the regions detect has accepted so far, read while it runs
+        job["scan"] = {"raw": raw, "prep": pm, "stl": stl, "noise": _noise(raw.vertices, raw.faces), "prog": prog,
+                       "det": _detect_async(detect, pm, progress=str(prog))}
         job["tri"] = pm.triangles
         job.pop("suggest", None)
     return job["scan"]
 
 
-# detect takes minutes on a real scan (2026-10-13: 121 s at 25k triangles, 433-1408 s at 100k), so it starts when
-# scan mode is entered and the user brushes meanwhile. ponytail: one thread, GIL-shared with the server (detect is
-# mostly numpy/scipy); a process pool if it starts starving requests
-_SCAN_POOL = ThreadPoolExecutor(1, thread_name_prefix="scan-detect")
+def _scan_upload(*, stl_path, out_path, workdir, stem, filename, n_in_tris, progress) -> dict:
+    """A scan declared at upload (bd projects-vgj7.3). The CAD builders (engine, edgebuild, feature pass) fit exact
+    surfaces to noise-free meshes: on a scan they found nothing and ran to their budgets (488 s on a 21k scan) before
+    the guided step was even reachable, and scan mode then discarded their output. Here the upload goes straight to
+    scanprep, detect starts in the background, and the token opens the guided step already in scan mode."""
+    _stage(progress, "scan")
+    t = time.time()
+    job = {"path": Path(out_path), "name": f"{stem}.step", "ts": t, "stl": Path(stl_path)}
+    try:
+        sc = _scan(job)
+    except Exception as e:  # noqa: BLE001 - a mesh scanprep cannot take is bad input, and the temp dir goes with it
+        __import__("shutil").rmtree(workdir, ignore_errors=True)
+        raise HTTPException(422, f"could not prepare this scan: {e}") from e
+    token = uuid.uuid4().hex
+    _JOBS[token] = job
+    return {"ok": True, "scan": True, "download_token": token,
+            "stats": {"engine": "scan", "backend": "scan", "n_input_tris": n_in_tris,
+                      "n_prep_tris": len(sc["prep"].faces), "seconds": round(time.time() - t, 2),
+                      "input_path": filename, "output_path": f"{stem}.step"}}
+
+
+# detect starts when scan mode is entered and the user brushes meanwhile. Its own process: in a thread its Python
+# loops and the request handlers took turns on one GIL (bd projects-vgj7.2). spawn, not fork: the server is threaded.
+# ponytail: one detect at a time, queued; more workers if scans ever overlap
+def _new_scan_pool():
+    import multiprocessing
+    import site
+
+    return __import__("concurrent.futures").futures.ProcessPoolExecutor(
+        1, mp_context=multiprocessing.get_context("spawn"),
+        initializer=site.addsitedir, initargs=(str(EDGEBUILD.parent),))   # scanransac importable in the worker
+
+
+_SCAN_POOL = None
+
+
+def _detect_async(fn, mesh, **kw):
+    global _SCAN_POOL
+    from concurrent.futures.process import BrokenProcessPool
+
+    for _ in range(2):          # a worker killed (OOM, restart) breaks the pool for good: replace it once
+        try:
+            _SCAN_POOL = _SCAN_POOL or _new_scan_pool()
+            return _SCAN_POOL.submit(fn, mesh, **kw)
+        except BrokenProcessPool:
+            _SCAN_POOL = None
+    raise RuntimeError("could not start surface detection")
 
 
 def _ui_params(kind, p):
@@ -1836,13 +1889,18 @@ def _ui_params(kind, p):
 
 
 @app.get("/api/guide/{token}/mesh")
-def guide_mesh(token: str, scan: bool = False):
+def guide_mesh(token: str, request: Request, scan: bool = False):
     job, _ = _guide_tri(token)
     if scan:
         _scan(job)
     tri = job["tri"]
     pos = __import__("numpy").round(tri, 5).reshape(-1).tolist()
-    return {"positions": pos, "n_triangles": len(tri), "scan": "scan" in job}
+    body = json.dumps({"positions": pos, "n_triangles": len(tri), "scan": "scan" in job}).encode()
+    # 9.0 MB of JSON for a 100k-triangle scan, 2.1 MB gzipped: the proxy does not compress this site
+    if "gzip" in request.headers.get("accept-encoding", ""):
+        return Response(__import__("gzip").compress(body, 5), media_type="application/json",
+                        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+    return Response(body, media_type="application/json")
 
 
 @app.get("/api/guide/{token}/suggest")
@@ -1851,22 +1909,38 @@ def guide_suggest(token: str, kind: str):
 
     job, tri = _guide_tri(token)
     cache = job.setdefault("suggest", {})
+    if kind not in cache and "scan" in job:
+        # on a scan the detect regions are the suggestions. guide.suggest fits at CAD tolerance: on the 25k mechpart
+        # scan it took 13 s per kind for 0 regions, and it ran again on every 10 s poll while detect was pending,
+        # holding the GIL detect's thread needs (bd projects-vgj7.2)
+        import numpy as np
+
+        if kind not in guide.KINDS:
+            raise HTTPException(400, f"unknown kind {kind!r}")
+        def regions(d):
+            lab = np.asarray(d["label"])
+            return [{"triangles": np.flatnonzero(lab == int(i)).tolist(), "surface": k, "kind": k,
+                     "params": _ui_params(k, d["params"][i])}
+                    for i, k in d["kinds"].items() if k == kind]
+
+        det = job["scan"]["det"]
+        if not det.done():
+            # the regions accepted so far, largest first (cam-gear: the first at 1.6 s, all by 38 s, the merge to
+            # 84 s). Not cached: the next poll sees more, and the final merged set replaces them
+            try:
+                part = __import__("pickle").loads(job["scan"]["prog"].read_bytes())
+            except (OSError, EOFError):
+                part = None
+            return {"regions": regions(part) if part else [], "pending": True}
+        if det.exception():      # no suggestions; the brush still works
+            print(f"SRVSCAN detect failed: {det.exception()!r}", file=sys.stderr, flush=True)
+            return {"regions": []}
+        cache[kind] = regions(det.result())
     if kind not in cache:
         try:
             cache[kind] = guide.suggest(tri, kind)
         except ValueError as e:
             raise _guide_error(e) from e
-        if "scan" in job:     # guide fits at CAD tolerance; on a scan the RANSAC regions are the suggestions
-            import numpy as np
-
-            if not job["scan"]["det"].done() or job["scan"]["det"].exception():
-                return {"regions": cache.pop(kind), "pending": True}
-            det = job["scan"]["det"].result()
-            lab = np.asarray(det["label"])
-            cache[kind] = cache[kind] + [
-                {"triangles": np.flatnonzero(lab == int(i)).tolist(), "surface": k, "kind": k,
-                 "params": _ui_params(k, det["params"][i])}
-                for i, k in det["kinds"].items() if k == kind]
     return {"regions": cache[kind]}
 
 

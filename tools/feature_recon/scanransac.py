@@ -10,6 +10,9 @@ Two techniques:
 Kinds: plane, cylinder, cone, sphere, torus.
 """
 
+import os
+import time
+
 import numpy as np
 import scipy.optimize
 import scipy.sparse as sp
@@ -28,6 +31,13 @@ SEEDS_PER_ROUND = 60
 NEIGHBOURS = 40
 TORUS_NEIGHBOURS = 200
 N_TRIES = 5
+# Regions kept per round: every seed's best candidate is grown anyway, and the single-best rule threw all but one
+# away, so a scan took one round per region (bd projects-vgj7.2). Up to ACCEPT_MAX of a round's candidates are kept,
+# best first, each only while it overlaps nothing taken before it and scores at least ACCEPT_FRAC of the round's best.
+# ACCEPT_MAX = 1 is the original algorithm exactly. Env overrides for the A/B on tools/scanuser_eval.py
+ACCEPT_MAX = int(os.environ.get("SCANRANSAC_ACCEPT_MAX", "1"))
+ACCEPT_FRAC = float(os.environ.get("SCANRANSAC_ACCEPT_FRAC", "0.5"))
+PROGRESS_S = 1.0        # detect(progress=...): at most one publish per second during the rounds
 COMPLEXITY = {"plane": 0, "sphere": 1, "cylinder": 2, "cone": 3, "torus": 4}
 KINDS_ORDER = ["plane", "sphere", "cylinder", "cone", "torus"]
 
@@ -49,34 +59,33 @@ def curvature(mesh: trimesh.Trimesh, k: int = 3) -> tuple[np.ndarray, np.ndarray
         Ak = Ak @ A
     Ak = Ak.tocsr()
 
+    # every vertex's local quadric h = a x^2 + b xy + c y^2 + d x + e y at once, through the 5x5 normal equations
+    # (per-entry sums by bincount); the per-vertex lstsq loop took 16 s of detect on cam-gear (bd projects-vgj7.2)
     k1 = np.zeros(n)
     k2 = np.zeros(n)
-
-    for v in range(n):
-        nbrs = Ak.indices[Ak.indptr[v]:Ak.indptr[v + 1]]
-        if len(nbrs) < 6:
-            continue
-        p = V[v]
-        nv = normals[v]
-        ref = np.array([1.0, 0.0, 0.0]) if abs(nv[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        u = np.cross(nv, ref)
-        u /= np.linalg.norm(u)
-        w = np.cross(nv, u)
-
-        d = V[nbrs] - p
-        x = d @ u
-        y = d @ w
-        h = d @ nv
-
-        M = np.column_stack([x * x, x * y, y * y, x, y])
-        coeffs, _, _, _ = np.linalg.lstsq(M, h, rcond=None)
-        a, b, c = coeffs[0], coeffs[1], coeffs[2]
-
-        H = np.array([[2 * a, b], [b, 2 * c]])
-        eig = np.linalg.eigvalsh(H)
-        idx = np.argsort(-np.abs(eig))
-        k1[v] = eig[idx[0]]
-        k2[v] = eig[idx[1]]
+    deg = np.diff(Ak.indptr)
+    rows = np.repeat(np.arange(n), deg)
+    ref = np.where((np.abs(normals[:, 0]) < 0.9)[:, None], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+    u = np.cross(normals, ref)
+    u /= np.linalg.norm(u, axis=1, keepdims=True)
+    w = np.cross(normals, u)
+    d = V[Ak.indices] - V[rows]
+    x = np.einsum("ij,ij->i", d, u[rows])
+    y = np.einsum("ij,ij->i", d, w[rows])
+    h = np.einsum("ij,ij->i", d, normals[rows])
+    M = [x * x, x * y, y * y, x, y]
+    G = np.empty((n, 5, 5))
+    for i in range(5):
+        for j in range(i, 5):
+            G[:, i, j] = G[:, j, i] = np.bincount(rows, M[i] * M[j], minlength=n)
+    rhs = np.stack([np.bincount(rows, m * h, minlength=n) for m in M], axis=1)
+    ok = deg >= 6
+    coef = np.einsum("nij,nj->ni", np.linalg.pinv(G[ok]), rhs[ok])     # pinv: a degenerate ring gives a finite answer
+    H = np.stack([np.stack([2 * coef[:, 0], coef[:, 1]], -1), np.stack([coef[:, 1], 2 * coef[:, 2]], -1)], -2)
+    eig = np.linalg.eigvalsh(H)
+    order = np.argsort(-np.abs(eig), axis=1)
+    eig = np.take_along_axis(eig, order, axis=1)
+    k1[ok], k2[ok] = eig[:, 0], eig[:, 1]
 
     return k1, k2
 
@@ -151,6 +160,73 @@ DIST = {
     "cone": _dist_cone,
     "torus": _dist_torus,
 }
+
+
+def _unit_jac(g, a, norm):
+    """Chain rows g = d(residual)/d(unit vector a) through a = raw / |raw|."""
+    return (g - (g @ a)[:, None] * a) / norm
+
+
+def _jac_plane(x, X):
+    nn = np.linalg.norm(x[:3])
+    n = x[:3] / nn
+    return np.c_[_unit_jac(X, n, nn), -np.ones(len(X))]
+
+
+def _jac_cylinder(x, X):
+    an = np.linalg.norm(x[:3])
+    a = x[:3] / an
+    v = X - x[3:6]
+    h = v @ a
+    rad = v - h[:, None] * a
+    u = rad / np.maximum(np.linalg.norm(rad, axis=1), 1e-300)[:, None]
+    return np.c_[_unit_jac(-h[:, None] * u, a, an), -u, -np.ones(len(X))]
+
+
+def _jac_sphere(x, X):
+    v = X - x[:3]
+    u = v / np.maximum(np.linalg.norm(v, axis=1), 1e-300)[:, None]
+    return np.c_[-u, -np.ones(len(X))]
+
+
+def _jac_cone(x, X):
+    an = np.linalg.norm(x[3:6])
+    a = x[3:6] / an
+    t = x[6]
+    v = X - x[:3]
+    h = v @ a
+    rad = v - h[:, None] * a
+    rho = np.linalg.norm(rad, axis=1)
+    u = rad / np.maximum(rho, 1e-300)[:, None]
+    ct, st = np.cos(t), np.sin(t)
+    g_a = -ct * h[:, None] * u - st * v
+    return np.c_[-ct * u + st * a, _unit_jac(g_a, a, an), -rho * st - h * ct]
+
+
+def _jac_torus(x, X):
+    c = x[:3]
+    an = np.linalg.norm(x[3:6])
+    a = x[3:6] / an
+    R = x[6]
+    v = X - c
+    h = v @ a
+    rad = v - h[:, None] * a
+    rho = np.maximum(np.linalg.norm(rad, axis=1), 1e-300)
+    e = rad / rho[:, None]
+    ds = X - (c + R * e)
+    n2 = ds / np.maximum(np.linalg.norm(ds, axis=1), 1e-300)[:, None]
+    k = (R / rho)[:, None]
+    na = (n2 @ a)[:, None]
+    ne = np.einsum("ij,ij->i", n2, e)[:, None]
+    g_c = -n2 + k * ((n2 - na * a) - ne * e)
+    g_a = k * (na * v + h[:, None] * (n2 - ne * e))
+    return np.c_[g_c, _unit_jac(g_a, a, an), -ne, -np.ones(len(X))]
+
+
+# d(residual)/d(x) in closed form: least_squares otherwise differenced it, n_params + 1 residual passes per Jacobian,
+# and refine was half of detect's time on a scan (bd projects-vgj7.2). tests/test_scanransac_fast.py checks these
+# against finite differences
+JAC = {"plane": _jac_plane, "cylinder": _jac_cylinder, "sphere": _jac_sphere, "cone": _jac_cone, "torus": _jac_torus}
 
 
 def _cand_plane(Cs, Ns):
@@ -277,13 +353,30 @@ def _cand_torus(Cs, Ns, kts, Cj, Nj, ktj, Cl, Nl, ktl, diag):
     return np.array([centre[0], centre[1], centre[2], a[0], a[1], a[2], R, r])
 
 
+REFINE_MAX_PTS = int(os.environ.get("SCANRANSAC_REFINE_MAX_PTS", "0"))   # 0: every point
+# a fit still moving after this many evaluations is a degenerate one (tiny patch, wrong kind): 27 of 900 refines on
+# mechpart ran the old 200 to the end and returned status 0
+MAX_NFEV = int(os.environ.get("SCANRANSAC_MAX_NFEV", "200"))
+# Closed-form Jacobians halve detect (cam-gear 84 -> 45 s) with the same user-level and build counts on 30 parts, but
+# they move every fit by rounding, and the greedy region order turns that into different junk regions on some parts
+# (2 of 30 builds swap; the synthetic plate's brush build breaks). Opt-in until the fill guard rejects junk regions
+NUMERIC_JAC = os.environ.get("SCANRANSAC_ANALYTIC_JAC") != "1"
+
+
 def _refine(kind, x0, Vc, eps):
+    # a fixed random subset bounds the cost on big regions (least squares on noise: the parameters' error falls as
+    # 1/sqrt(points), so 1500 points of a 20k-vertex plane lose nothing measurable); callers score on all points
+    if REFINE_MAX_PTS and len(Vc) > REFINE_MAX_PTS:
+        Vc = Vc[np.sort(np.random.default_rng(0).choice(len(Vc), REFINE_MAX_PTS, replace=False))]
+
     def residual(x):
         d, _ = DIST[kind](x, Vc)
         return d
 
     try:
-        result = scipy.optimize.least_squares(residual, x0, loss="soft_l1", f_scale=eps, max_nfev=200)
+        jac = "2-point" if NUMERIC_JAC else (lambda x: JAC[kind](x, Vc))
+        result = scipy.optimize.least_squares(residual, x0, jac=jac,
+                                              loss="soft_l1", f_scale=eps, max_nfev=MAX_NFEV)
         if result.cost < np.inf:
             return result.x
     except Exception:
@@ -376,6 +469,40 @@ def _component(fa, inlier_idx, seed, nf):
     return inlier_idx[comp_local]
 
 
+def _neighbours(fa, nf):
+    """(nf, D) edge neighbours of every face, -1 padded: a growth step gathers a whole frontier's neighbours at once."""
+    e = np.concatenate([fa, fa[:, ::-1]]) if len(fa) else np.zeros((0, 2), dtype=np.int64)
+    e = e[np.argsort(e[:, 0], kind="stable")]
+    deg = np.bincount(e[:, 0], minlength=nf)
+    NB = np.full((nf, max(int(deg.max(initial=0)), 1)), -1, dtype=np.int64)
+    NB[e[:, 0], np.arange(len(e)) - (np.cumsum(deg) - deg)[e[:, 0]]] = e[:, 1]
+    return NB
+
+
+def _grow(kind, x, s, NB, C, N, free, eps):
+    """The free triangles inlying model x and edge-connected to seed s: the set that scoring every free triangle and
+    then taking s's connected component (_component) gives, at the cost of the region instead of the mesh. That global
+    pass per candidate, ~300 candidates per round, was detect's whole cost on a scan (bd projects-vgj7.2)."""
+    d, n = DIST[kind](x, C[s:s + 1])
+    if not (abs(d[0]) < eps and abs(N[s] @ n[0]) > COS_ALPHA):
+        return np.zeros(0, dtype=np.int64)
+    seen = ~free
+    seen[s] = True
+    front = np.array([s])
+    parts = [front]
+    while front.size:
+        c = NB[front].ravel()
+        c = c[c >= 0]
+        c = np.unique(c[~seen[c]])
+        if not c.size:
+            break
+        seen[c] = True
+        d, n = DIST[kind](x, C[c])
+        front = c[(np.abs(d) < eps) & (np.abs((N[c] * n).sum(axis=1)) > COS_ALPHA)]
+        parts.append(front)
+    return np.sort(np.concatenate(parts))     # sorted like _component's: the area sum is then the same float
+
+
 def _fit_plane(Vc):
     c = Vc.mean(0)
     _, _, Vt = np.linalg.svd(Vc - c, full_matrices=False)
@@ -395,9 +522,7 @@ def _fit_sphere(Vc):
 
 
 def _fit_cylinder(Vc, Nc):
-    S = np.zeros((3, 3))
-    for n in Nc:
-        S += np.outer(n, n)
+    S = Nc.T @ Nc                  # sum of n n^T; the per-normal Python loop was 6.3M np.outer calls on cam-gear
     eigvals, eigvecs = np.linalg.eigh(S)
     a = eigvecs[:, 0]
     c = Vc.mean(0)
@@ -564,8 +689,18 @@ def _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag):
         return label, kinds, params
 
     def _get_face_sets():
-        active = set(label[label >= 0].tolist())
-        return {rid: np.where(label == rid)[0] for rid in active}
+        # one stable sort instead of a full-mesh np.where per region per pass; each set stays sorted ascending
+        order = np.argsort(label, kind="stable")
+        ls = label[order]
+        cut = np.flatnonzero(np.diff(ls)) + 1
+        return {int(g[0]): order[i:j] for g, i, j in zip(np.split(ls, cut), np.r_[0, cut], np.r_[cut, len(ls)])
+                if g[0] >= 0}
+
+    # A pair's verdict depends only on its two regions, which change only when one of them absorbs a neighbour. The
+    # scan below restarts after every merge, so without this every failed pair was refitted again after every merge:
+    # 235 of detect's 487 s on cam-gear (bd projects-vgj7.2). Same pairs, same order, same merges.
+    version = {}
+    failed = set()
 
     def _rms_for(kind, x, verts):
         d, _ = DIST[kind](x, verts)
@@ -591,6 +726,9 @@ def _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag):
             kind_b = kinds.get(b)
             if kind_a is None or kind_b is None:
                 continue
+            key = (a, b, version.get(a, 0), version.get(b, 0))
+            if key in failed:
+                continue
             larger = a if len(face_sets[a]) >= len(face_sets[b]) else b
             smaller = b if larger == a else a
             candidate_kinds = []
@@ -610,6 +748,13 @@ def _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag):
             rms_a = _rms_for(kind_a, x_a, verts_a)
             rms_b = _rms_for(kind_b, x_b, verts_b)
             for ck in candidate_kinds:
+                if ck == "plane":
+                    # no plane fits the union with a lower rms than the least-squares one, sqrt(smallest eigenvalue
+                    # of the covariance); when even that fails the test below, the refit cannot pass it: skip it
+                    q = verts_union - verts_union.mean(0)
+                    floor = np.sqrt(max(np.linalg.eigvalsh(q.T @ q / len(q))[0], 0.0))
+                    if floor > eps or floor > 1.5 * max(rms_a, rms_b):
+                        continue
                 if kinds[larger] == ck:
                     x0 = _from_params(ck, params[larger])
                 elif ck == "plane":
@@ -630,10 +775,12 @@ def _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag):
                     params[larger] = _to_params(ck, x_ref)
                     del kinds[smaller]
                     del params[smaller]
+                    version[larger] = version.get(larger, 0) + 1
                     merged = True
                     break
             if merged:
                 break
+            failed.add(key)
     old_ids = sorted(set(label[label >= 0].tolist()))
     if not old_ids:
         return label, {}, {}
@@ -683,7 +830,21 @@ def _fill_gaps(label, kinds, params, C, fa):
     return label
 
 
-def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
+def _publish(path, label, kinds, params):
+    """The regions accepted so far, for a reader polling while detect runs (atomic: write, then rename)."""
+    import os
+    import pickle
+
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump({"label": label.copy(), "kinds": dict(kinds), "params": dict(params)}, f)
+    os.replace(tmp, path)
+
+
+def detect(mesh: trimesh.Trimesh, seed: int = 0, progress: str | None = None) -> dict:
+    """progress: a path the regions accepted so far are published to, every PROGRESS_S while the rounds run and once
+    before the merge. On cam-gear the first region is accepted at 1.6 s, the last at 38 s, the merge ends at 84 s:
+    the user sees the big surfaces at once instead of after the merge (bd projects-vgj7.2)."""
     # an STL loads as a triangle soup: no shared vertices, no adjacency, every component one triangle.
     # merge_vertices keeps the faces (and so the label order) as they are
     mesh = mesh.copy()
@@ -709,39 +870,38 @@ def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
     kt = (k1[F[:, 0]] + k1[F[:, 1]] + k1[F[:, 2]]) / 3
 
     tree = cKDTree(C)
+    NB = _neighbours(fa, nf)
     rng = np.random.default_rng(seed)
 
     label = np.full(nf, -1, dtype=int)
     kinds = {}
     params = {}
-    next_id = 0
     failed = 0
+    published = 0.0         # the first accepted region goes out at once
 
     for _ in range(MAX_ROUNDS):
         unassigned = np.where(label == -1)[0]
         if len(unassigned) == 0:
             break
 
+        free = label == -1
         areas_u = A[unassigned]
         p = areas_u / areas_u.sum()
         n_seeds = min(SEEDS_PER_ROUND, len(unassigned))
         seeds = unassigned[rng.choice(len(unassigned), size=n_seeds, replace=False, p=p)]
 
-        best_kind = None
-        best_x = None
-        best_comp = None
-        best_score = 0.0
+        pool = []       # each seed's best candidate this round: (score, kind, x, comp)
 
-        for s in seeds:
-            kq = min(NEIGHBOURS * 3, nf)
-            _, nbr_idx = tree.query(C[s], k=kq)
-            nbrs = [int(i) for i in nbr_idx if i != s and label[i] == -1][:NEIGHBOURS]
+        kq = min(NEIGHBOURS * 3, nf)
+        kq_t = min(TORUS_NEIGHBOURS * 3, nf)
+        # one query per round for every seed; the near list is the far list's first kq (both sorted by distance)
+        nbr_all = tree.query(C[seeds], k=max(kq, kq_t))[1].reshape(len(seeds), -1)
+        for s, nbr_idx_t in zip(seeds, nbr_all):
+            ok = (nbr_idx_t != s) & free[nbr_idx_t]
+            nbrs = nbr_idx_t[:kq][ok[:kq]][:NEIGHBOURS]
             if len(nbrs) < 1:
                 continue
-
-            kq_t = min(TORUS_NEIGHBOURS * 3, nf)
-            _, nbr_idx_t = tree.query(C[s], k=kq_t)
-            nbrs_t = [int(i) for i in nbr_idx_t if i != s and label[i] == -1][:TORUS_NEIGHBOURS]
+            nbrs_t = nbr_idx_t[:kq_t][ok[:kq_t]][:TORUS_NEIGHBOURS]
 
             cands = {}
 
@@ -816,16 +976,8 @@ def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
                 if kind not in cands or cands[kind] is None:
                     continue
                 x = cands[kind]
-                d, normal = DIST[kind](x, C[unassigned])
-                dot = np.abs((N[unassigned] * normal).sum(axis=1))
-                inlier_mask = (np.abs(d) < eps) & (dot > COS_ALPHA)
-                inlier_count = int(inlier_mask.sum())
-                if inlier_count < MIN_TRIS:
-                    continue
-
-                inlier_idx = unassigned[inlier_mask]
-                comp = _component(fa, inlier_idx, s, nf)
-                if len(comp) < MIN_TRIS:
+                comp = _grow(kind, x, s, NB, C, N, free, eps)
+                if len(comp) < MIN_TRIS:     # fewer connected inliers than MIN_TRIS implies the old global count test
                     continue
                 score = float(A[comp].sum())
 
@@ -839,73 +991,34 @@ def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
                     seed_best_comp = comp
                     seed_best_score = score
 
-            if seed_best_kind is not None and seed_best_score > best_score:
-                best_kind = seed_best_kind
-                best_x = seed_best_x
-                best_comp = seed_best_comp
-                best_score = seed_best_score
+            if seed_best_kind is not None:
+                pool.append((seed_best_score, seed_best_kind, seed_best_x, seed_best_comp))
 
-        if best_kind is None:
+        if not pool:
             failed += 1
             if failed >= MAX_FAILED:
                 break
             continue
 
         failed = 0
-
-        # Refine
-        comp_verts = np.unique(F[best_comp])
-        x_ref = _refine(best_kind, best_x, V[comp_verts], eps)
-
-        # Recompute inliers with refined model
-        d, normal = DIST[best_kind](x_ref, C)
-        dot = np.abs((N * normal).sum(axis=1))
-        inlier_mask = (np.abs(d) < eps) & (dot > COS_ALPHA)
-        inlier_mask[label != -1] = False
-
-        inlier_count = int(inlier_mask.sum())
-        if inlier_count >= MIN_TRIS:
-            inlier_idx = np.where(inlier_mask)[0]
-            old_set = set(best_comp.tolist())
-            lookup = np.full(nf, -1, dtype=np.int32)
-            lookup[inlier_idx] = np.arange(len(inlier_idx))
-            lr = lookup[fa[:, 0]]
-            lc = lookup[fa[:, 1]]
-            mask = (lr >= 0) & (lc >= 0)
-            sub = sp.coo_matrix(
-                (np.ones(int(mask.sum()), dtype=float), (lr[mask], lc[mask])),
-                shape=(len(inlier_idx), len(inlier_idx)),
-            ).tocsr()
-            n_comp, comp_labels = scipy.sparse.csgraph.connected_components(sub, directed=False)
-            best_overlap = 0
-            best_members = inlier_idx
-            for ci in range(n_comp):
-                members_local = np.where(comp_labels == ci)[0]
-                members = inlier_idx[members_local]
-                overlap = len(set(members.tolist()) & old_set)
-                if overlap > best_overlap:
-                    best_overlap = overlap
-                    best_members = members
-            if len(best_members) >= MIN_TRIS:
-                best_comp = best_members
-
-        if len(best_comp) < MIN_TRIS:
+        pool.sort(key=lambda c: -c[0])      # stable: among equal scores the first seed wins, as before
+        accepted = 0
+        for best_score, best_kind, best_x, best_comp in pool[:ACCEPT_MAX]:
+            if best_score < ACCEPT_FRAC * pool[0][0]:
+                break
+            if (label[best_comp] != -1).any():      # a region taken earlier this round reaches into it
+                continue
+            accepted += _accept_region(best_kind, best_x, best_comp, label, kinds, params, F, V, C, N, fa, nf, eps, diag)
+        if accepted and progress and time.time() - published > PROGRESS_S:
+            _publish(progress, label, kinds, params)
+            published = time.time()
+        if not accepted:
             failed += 1
             if failed >= MAX_FAILED:
                 break
-            continue
 
-        # Kind selection
-        Vc = V[np.unique(F[best_comp])]
-        Nc = N[best_comp]
-        best_kind, x_ref = _select_kind(Vc, Nc, best_kind, x_ref, eps, diag)
-
-        # Assign
-        label[best_comp] = next_id
-        kinds[next_id] = best_kind
-        params[next_id] = _to_params(best_kind, x_ref)
-        next_id += 1
-
+    if progress:
+        _publish(progress, label, kinds, params)
     # Merge fragments
     label, kinds, params = _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag)
 
@@ -913,3 +1026,52 @@ def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
     label = _fill_gaps(label, kinds, params, C, fa)
 
     return {"label": label, "kinds": kinds, "params": params}
+
+
+def _accept_region(kind, x, comp, label, kinds, params, F, V, C, N, fa, nf, eps, diag):
+    """Refine a winning candidate, regrow it under the refined model, settle its kind and assign it. -> 1 if kept."""
+    best_kind, best_x, best_comp = kind, x, comp
+    # Refine
+    comp_verts = np.unique(F[best_comp])
+    x_ref = _refine(best_kind, best_x, V[comp_verts], eps)
+
+    # Recompute inliers with refined model
+    d, normal = DIST[best_kind](x_ref, C)
+    dot = np.abs((N * normal).sum(axis=1))
+    inlier_mask = (np.abs(d) < eps) & (dot > COS_ALPHA)
+    inlier_mask[label != -1] = False
+
+    inlier_count = int(inlier_mask.sum())
+    if inlier_count >= MIN_TRIS:
+        inlier_idx = np.where(inlier_mask)[0]
+        lookup = np.full(nf, -1, dtype=np.int32)
+        lookup[inlier_idx] = np.arange(len(inlier_idx))
+        lr = lookup[fa[:, 0]]
+        lc = lookup[fa[:, 1]]
+        mask = (lr >= 0) & (lc >= 0)
+        sub = sp.coo_matrix(
+            (np.ones(int(mask.sum()), dtype=float), (lr[mask], lc[mask])),
+            shape=(len(inlier_idx), len(inlier_idx)),
+        ).tocsr()
+        n_comp, comp_labels = scipy.sparse.csgraph.connected_components(sub, directed=False)
+        # the component holding most of the candidate (first on ties); none at all keeps every inlier
+        own = lookup[best_comp]
+        overlap = np.bincount(comp_labels[own[own >= 0]], minlength=n_comp)
+        best_members = inlier_idx[comp_labels == int(np.argmax(overlap))] if overlap.max(initial=0) > 0 else inlier_idx
+        if len(best_members) >= MIN_TRIS:
+            best_comp = best_members
+
+    if len(best_comp) < MIN_TRIS:
+        return 0
+
+    # Kind selection
+    Vc = V[np.unique(F[best_comp])]
+    Nc = N[best_comp]
+    best_kind, x_ref = _select_kind(Vc, Nc, best_kind, x_ref, eps, diag)
+
+    # Assign
+    rid = len(kinds)
+    label[best_comp] = rid
+    kinds[rid] = best_kind
+    params[rid] = _to_params(best_kind, x_ref)
+    return 1

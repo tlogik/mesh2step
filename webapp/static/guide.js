@@ -1,6 +1,6 @@
 // guided feature selection — written in M3 (see .claude/loopspec/guided-m3-guide-ui.spec.md)
 export async function startGuide(ctx) {
-  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls } = ctx;
+  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls, scan } = ctx;
   hideOthers();
   // Make panel fixed on top of the canvas so buttons are clickable
   panel.style.cssText = 'position:fixed;top:10px;right:10px;width:280px;z-index:99999;background:#fff;padding:10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);font-family:system-ui,sans-serif;font-size:14px;';
@@ -27,7 +27,7 @@ export async function startGuide(ctx) {
     brushR = geo.boundingBox.getSize(new THREE.Vector3()).length() * 0.02;
     return meshData;
   }
-  await loadMesh(false);
+  await loadMesh(!!scan);     // declared a scan at upload: the server already prepped it and detect is running
 
   const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide });
   const mesh = new THREE.Mesh(geo, mat);
@@ -82,6 +82,7 @@ export async function startGuide(ctx) {
   buildBtn.style.display = 'none';
   const scanBtn = el('button', 'guide-scan', 'This is a 3D scan');
   scanBtn.title = 'Denoise the mesh, suggest surfaces found in the scan, and fit brushed areas on the raw scan';
+  if (scan) { scanBtn.disabled = true; scanBtn.textContent = '3D scan mode'; }
   const brushBtn = el('button', 'guide-brush', 'Brush');
   brushBtn.title = 'Paint a face (drag), then Fit: the surface of the current kind through the painted area';
   const brushSize = el('input', 'guide-brush-size');
@@ -174,8 +175,8 @@ export async function startGuide(ctx) {
     return (region && region.kind) || kind;
   }
 
-  async function enterStep() {
-    suggested = [];
+  async function enterStep(again) {
+    if (!again) suggested = [];       // a re-poll keeps the regions shown until the next set arrives
     updateUI();                       // the new step shows at once; suggestions arrive after the fetch
     if (step < steps.length) {
       const kind = steps[step][0];
@@ -192,8 +193,8 @@ export async function startGuide(ctx) {
         ? `${suggested.length} suggestion${suggested.length !== 1 ? 's' : ''}`
         : 'click or brush a surface to select it')
         + (pending ? ' \u2014 still finding surfaces in the scan, brush meanwhile' : '');
-      // a scan's surfaces are found in the background (minutes): ask again while this step is open
-      if (pending) { const s0 = step; setTimeout(() => { if (step === s0) enterStep(); }, 10000); }
+      // a scan's surfaces are found in the background and arrive largest first: ask again while this step is open
+      if (pending) { const s0 = step; setTimeout(() => { if (step === s0) enterStep(true); }, 3000); }
     }
     updateUI();
     recolour();
@@ -255,15 +256,12 @@ export async function startGuide(ctx) {
 
     for (const r of suggested) {
       if (r.triangles.includes(fi)) {
-        const already = selections.some(s => s.triangles.some(t => r.triangles.includes(t)));
-        if (already) {
-          selections = selections.filter(s => !s.triangles.some(t => r.triangles.includes(t)));
-        } else {
-          const selSet = new Set();
-          for (const s of selections) for (const t of s.triangles) selSet.add(t);
-          selections.push({ kind, surface: surfaceFor(kind, r), triangles: r.triangles.filter(t => !selSet.has(t)), params: r.params });
-          paramsEl.textContent = fmtParam(r);
-        }
+        // the clicked triangle is unselected (checked above): add the region's unselected rest. A scan's final
+        // regions can overlap one taken from an earlier, partial suggestion; that one is not undone by this click
+        const selSet = new Set();
+        for (const s of selections) for (const t of s.triangles) selSet.add(t);
+        selections.push({ kind, surface: surfaceFor(kind, r), triangles: r.triangles.filter(t => !selSet.has(t)), params: r.params });
+        paramsEl.textContent = fmtParam(r);
         recolour();
         return;
       }

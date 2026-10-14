@@ -39,7 +39,9 @@ def _remesh(mesh):
     import pymeshlab as ml
 
     L = float(np.median(mesh.edges_unique_length))
-    L = max(L, float(np.sqrt(4 * mesh.area / (np.sqrt(3) * MAX_FACES))))
+    # aimed at 90 % of the cap: aimed at the cap itself cam-gear came out at 110.6k for 110k and the whole 7 s remesh
+    # ran again (bd projects-vgj7.2)
+    L = max(L, float(np.sqrt(4 * mesh.area / (np.sqrt(3) * 0.9 * MAX_FACES))))
     for _ in range(4):
         ms = ml.MeshSet()
         ms.add_mesh(ml.Mesh(mesh.vertices, mesh.faces))
@@ -62,12 +64,21 @@ def _noise(V, F):
     ).tocsr()
     adj = (A @ A.T).tocsr()
     adj2 = (adj @ adj).tocsr()
-    d = np.empty(n)
-    for v in range(n):
-        P = V[adj2.indices[adj2.indptr[v] : adj2.indptr[v + 1]]]
-        c = P.mean(0)
-        nrm = np.linalg.svd(P - c, full_matrices=False)[2][-1]
-        d[v] = abs((V[v] - c) @ nrm)
+    adj2.data[:] = 1.0
+    # every vertex's 2-ring plane at once: the smallest eigenvector of the ring's covariance is the plane the per-vertex
+    # SVD found. The loop took seconds per call and runs three times per scan (prep, detect, the server's raw noise);
+    # coordinates are taken relative to the vertex so the covariance does not cancel catastrophically
+    cnt = np.asarray(adj2.sum(1)).ravel()
+    rows = np.repeat(np.arange(n), np.diff(adj2.indptr))
+    Q = V[adj2.indices] - V[rows]                        # ring points relative to their vertex
+    c = np.zeros((n, 3))
+    np.add.at(c, rows, Q)
+    c /= cnt[:, None]
+    Qc = Q - c[rows]
+    cov = np.zeros((n, 3, 3))
+    np.add.at(cov, rows, Qc[:, :, None] * Qc[:, None, :])
+    nrm = np.linalg.eigh(cov)[1][:, :, 0]                # eigenvalues ascending: column 0 is the plane normal
+    d = np.abs(np.einsum("ij,ij->i", c, nrm))             # |(V[v] - centroid) . n| with V[v] at the origin
     return float(np.median(d))
 
 
@@ -92,10 +103,10 @@ def _filter_normals(V, F, rows, cols):
     dc = np.linalg.norm(C[rows] - C[cols], axis=1)
     sigma_s = SIGMA_S * float(dc.mean())
     ws = area[cols] * np.exp(-(dc**2) / (2 * sigma_s**2))
+    nf = len(F)
     for _ in range(NORMAL_ITERS):
         w = ws * np.exp(-(np.linalg.norm(N[rows] - N[cols], axis=1) ** 2) / (2 * SIGMA_R**2))
-        acc = np.zeros_like(N)
-        np.add.at(acc, rows, w[:, None] * N[cols])
+        acc = sp.csr_matrix((w, (rows, cols)), shape=(nf, nf)) @ N   # the weighted neighbour sum (np.add.at: 3.5 s)
         acc += area[:, None] * N  # the face itself (weight 1 in both kernels)
         N = acc / np.maximum(np.linalg.norm(acc, axis=1), 1e-300)[:, None]
     return N
@@ -110,8 +121,7 @@ def _update_vertices(V, F, N, limit=np.inf):
         C = V[F].mean(1)
         vi = F.ravel()
         step = N[fi] * np.einsum("ij,ij->i", N[fi], C[fi] - V[vi])[:, None]
-        acc = np.zeros_like(V)
-        np.add.at(acc, vi, step)
+        acc = np.stack([np.bincount(vi, step[:, k], minlength=len(V)) for k in range(3)], axis=1)
         V += acc / np.maximum(cnt, 1)
         d = V - V0  # data fidelity: never further than `limit` from the scan
         r = np.linalg.norm(d, axis=1, keepdims=True)
