@@ -258,6 +258,11 @@ def main():
     shape = parts[0]
     for s in parts[1:]:
         shape = BRepAlgoAPI_Fuse(shape, s).Shape()
+    finish(shape, tri, sys.argv[2], t0)
+
+
+def finish(shape, tri, out_path, t0):
+    """unify, repair, radial fillets, census, mesh distance, STEP write + re-read check (shared with loft.py)"""
     import os
     if os.environ.get("NOUNIFY") != "1":
         u = ShapeUpgrade_UnifySameDomain(shape, True, True, False); u.Build(); shape = u.Shape()
@@ -293,16 +298,16 @@ def main():
         from OCP.BRepTools import BRepTools
         BRepTools.Write_s(shape, os.environ["DUMP_BREP"]); print("dumped", os.environ["DUMP_BREP"], flush=True)
     Interface_Static.SetCVal_s("write.step.schema", "AP214")
-    w = STEPControl_Writer(); w.Transfer(shape, STEPControl_AsIs); ok = w.Write(sys.argv[2]) == IFSelect_RetDone
-    r = STEPControl_Reader(); r.ReadFile(sys.argv[2]); r.TransferRoots()
+    w = STEPControl_Writer(); w.Transfer(shape, STEPControl_AsIs); ok = w.Write(out_path) == IFSelect_RetDone
+    r = STEPControl_Reader(); r.ReadFile(out_path); r.TransferRoots()
     back = r.OneShape(); anb = BRepCheck_Analyzer(back, True)
     if not anb.IsValid():
         back = repair_step_shape(back)
         w = STEPControl_Writer()
         w.Transfer(back, STEPControl_AsIs)
-        ok = w.Write(sys.argv[2]) == IFSelect_RetDone
+        ok = w.Write(out_path) == IFSelect_RetDone
         r = STEPControl_Reader()
-        r.ReadFile(sys.argv[2])
+        r.ReadFile(out_path)
         r.TransferRoots()
         back = r.OneShape()
         anb = BRepCheck_Analyzer(back, True)

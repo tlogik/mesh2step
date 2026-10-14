@@ -72,6 +72,8 @@ def _candidates(stl: Path, wd: Path):
     c.append(("turned", [py, RECON / "autorev_cut4.py", stl, wd / "C.step", wd / "C4.step"], {},
               wd / "C4.step"))
     c.append(("block", [py, RECON / "autoblock2.py", stl, wd / "E.step"], {}, wd / "E.step"))
+    # slice and loft on the stepped builder's axis: gradual sections lofted, constant loops still exact prisms
+    c.append(("loft", [py, RECON / "loft.py", stl, wd / "L.step", "60"], {}, wd / "L.step"))
     return c
 
 
