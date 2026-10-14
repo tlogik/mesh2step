@@ -274,25 +274,65 @@ def frame(d):
     return np.array([u, np.cross(d, u), d])
 
 
-def slabs_of(tri):
-    """slabs along Z: between the heights of the faces square to Z; and the area of those faces"""
+def slabs_of(tri, tol):
+    """slabs along Z between the heights of the faces square to Z, and the area of those faces. A face is square
+    within ~1 deg (0.99 let in the first facets of every fillet and chamfer: 118 slabs on mechparts/6, most under
+    0.01 mm, whose fuse destroyed the solid); heights closer than tol are one height (area-weighted), and no slab
+    is thinner than tol."""
     n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     area = np.linalg.norm(n, axis=1)
-    flat = np.abs(n[:, 2]) > 0.99 * np.maximum(area, 1e-300)
+    flat = np.abs(n[:, 2]) > 0.99985 * np.maximum(area, 1e-300)
     lo, hi = tri[:, :, 2].min(), tri[:, :, 2].max()
-    tot = {}
-    for h, a in zip(np.round(tri[flat][:, :, 2].mean(1), 3), area[flat]):
-        tot[h] = tot.get(h, 0.0) + a
-    big = max(tot.values()) if tot else 0.0
-    inner = sorted(h for h, a in tot.items() if a >= 1e-3 * big and lo + 1e-3 < h < hi - 1e-3)
-    bounds = [lo] + inner + [hi]
-    return [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b - a > 1e-3], float(area[flat].sum() / 2)
+    hz, a = tri[flat][:, :, 2].mean(1), area[flat]
+    o = np.argsort(hz); hz, a = hz[o], a[o]
+    groups = []                                   # [sum a*h, sum a]
+    for h, w in zip(hz, a):
+        if groups and h - groups[-1][2] <= tol:
+            groups[-1][0] += w * h; groups[-1][1] += w; groups[-1][2] = h
+        else:
+            groups.append([w * h, w, h])
+    big = max((g[1] for g in groups), default=0.0)
+    bounds = [lo]
+    for sw, w, _ in groups:
+        h = sw / w
+        if w >= 1e-3 * big and h - bounds[-1] > tol and hi - h > tol:
+            bounds.append(h)
+    bounds.append(hi)
+    return list(zip(bounds[:-1], bounds[1:])), float(a.sum() / 2)
 
 
-def choose_plane(tri):
+def nloops(t, h):
+    return len(section_loops(section_n(t, 2, h)[0]))
+
+
+def split_topology(t, slabs, step, tol):
+    """every slab cut again wherever its loop count changes (a cross hole, a boss starting mid-slab), each cut placed
+    by bisection between the samples on either side"""
+    out = []
+    for z0, z1 in slabs:
+        m = max(3, int(math.ceil((z1 - z0) / step)))
+        hs = list(np.linspace(z0 + 1e-3 * (z1 - z0), z1 - 1e-3 * (z1 - z0), m))
+        cs = [nloops(t, h) for h in hs]
+        a = z0
+        for i in range(m - 1):
+            if cs[i] == cs[i + 1]: continue
+            lo_, hi_ = hs[i], hs[i + 1]
+            for _ in range(12):
+                mid = 0.5 * (lo_ + hi_)
+                if nloops(t, mid) == cs[i]: lo_ = mid
+                else: hi_ = mid
+            cut = 0.5 * (lo_ + hi_)
+            if cut - a > tol and z1 - cut > tol:
+                out.append((a, cut)); a = cut
+        out.append((a, z1))
+    return out
+
+
+def choose_plane(tri, tol, N):
     """The slicing plane. Candidates: X, Y, Z and the normals of the 4 largest flat regions (other than those).
-    Score: the share of the height whose slabs keep one loop count at 3 heights (what loft.py can build), then the
-    area of the faces square to it (end faces, shoulders), then fewer slabs."""
+    Score: fewest slabs once cut at every flat face and every change of loop count (the direction along which the
+    part changes least: an extrusion's or a loft's axis), then the most flat area square to it (end faces,
+    shoulders). Returns (frame, slabs in that frame)."""
     n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     area = np.linalg.norm(n, axis=1)
     un = n / np.maximum(area[:, None], 1e-300)
@@ -310,33 +350,35 @@ def choose_plane(tri):
     best = None
     for d in cands:
         F = frame(d); t = tri @ F.T
-        slabs, flat_area = slabs_of(t)
-        H = t[:, :, 2].max() - t[:, :, 2].min()
-        ok = 0.0
-        for z0, z1 in slabs:
-            e = 1e-3 * (z1 - z0)
-            if len({len(section_loops(section_n(t, 2, h)[0])) for h in (z0 + e, 0.5 * (z0 + z1), z1 - e)}) == 1:
-                ok += z1 - z0
-        score = (round(ok / H, 2), round(flat_area / (area.sum() / 2), 2), -len(slabs))
-        print("plane normal (%.3f %.3f %.3f): buildable %.2f square flat area %.2f slabs %d" % (
-            *d, score[0], score[1], len(slabs)), flush=True)
-        if best is None or score > best[0]: best = (score, F)
-    return best[1]
+        slabs, flat_area = slabs_of(t, tol)
+        slabs = split_topology(t, slabs, (t[:, :, 2].max() - t[:, :, 2].min()) / N, tol)
+        score = (-len(slabs), round(flat_area / (area.sum() / 2), 2))
+        print("plane normal (%.3f %.3f %.3f): slabs %d square flat area %.2f" % (*d, len(slabs), score[1]),
+              flush=True)
+        if best is None or score > best[0]: best = (score, F, slabs)
+    return best[1], best[2]
 
 
 def main():
     t0 = time.time()
+    # ponytail: a hard wall-clock budget, not a cost model. The feature pass waits for its slowest builder and the
+    # others finish in 34-85 s on 65k-101k meshes; one OCCT call on mechparts/12 hung for 1800 s, so a check between
+    # slabs is not enough: SIGALRM's default action ends the process wherever it is
+    import signal
+    signal.alarm(int(os.environ.get("LOFT_BUDGET_S", "150")))
     tri = load(sys.argv[1]); N = int(sys.argv[3]) if len(sys.argv) > 3 else 60
     lo = tri.reshape(-1, 3).min(0); hi = tri.reshape(-1, 3).max(0)
     diag = float(np.linalg.norm(hi - lo))
     auto2d.LINE_TOL = auto2d.ARC_TOL = max(0.02, 2e-4 * diag)
+    tol = 2 * auto2d.LINE_TOL
     # 1. the slicing plane; the mesh turned so its normal is Z
-    F = (frame(np.eye(3)[int(os.environ["AXIS"])]) if os.environ.get("AXIS") in ("0", "1", "2")
-         else choose_plane(tri))
-    print("slicing plane normal (%.4f %.4f %.4f)" % tuple(F[2]), flush=True)
+    if os.environ.get("AXIS") in ("0", "1", "2"):
+        F = frame(np.eye(3)[int(os.environ["AXIS"])]); t = tri @ F.T
+        slabs = split_topology(t, slabs_of(t, tol)[0], (t[:, :, 2].max() - t[:, :, 2].min()) / N, tol)
+    else:
+        F, slabs = choose_plane(tri, tol, N)     # 2. its slabs: cut at flat faces and loop-count changes
+    print("slicing plane normal (%.4f %.4f %.4f), %d slabs" % (*F[2], len(slabs)), flush=True)
     t = tri @ F.T
-    # 2. slabs between the heights of the faces square to it
-    slabs, _ = slabs_of(t)
     step = (t[:, :, 2].max() - t[:, :, 2].min()) / N
     # 3. each slab
     parts = []
@@ -348,6 +390,8 @@ def main():
     shape = parts[0]
     for s in parts[1:]:
         shape = BRepAlgoAPI_Fuse(shape, s).Shape()
+        if shape.IsNull():
+            print("fuse failed"); return 2
     if not np.allclose(F, np.eye(3)):
         tr = gp_Trsf()     # world = F^T @ local
         G = F.T.tolist()

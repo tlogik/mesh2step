@@ -88,3 +88,14 @@ def test_loft_is_a_feature_candidate(tmp_path):
     from mesh2step.feature import _candidates
 
     assert "loft" in [c[0] for c in _candidates(tmp_path / "x.stl", tmp_path)]
+
+
+def test_loft_only_serves_when_nothing_else_qualifies():
+    sys.path.insert(0, str(ROOT / "src"))
+    from mesh2step.feature import choose
+
+    ok = dict(solids=1, valid=True, free_edges=0, dist_p95=0.01, diag=100.0, support=1.0)
+    stepped = dict(ok, cylinders=6, dv_pct=0.6)
+    loft = dict(ok, cylinders=2, dv_pct=0.01)
+    assert choose([["stepped", stepped], ["loft", loft]], 0)["method"] == "stepped"
+    assert choose([["stepped", None], ["loft", loft]], 0)["method"] == "loft"

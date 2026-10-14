@@ -219,13 +219,27 @@ def acceptable(m: dict | None) -> bool:
                 and m["dist_p95"] <= MAX_DIST_P95_REL * m["diag"])
 
 
+# a fallback builder is served only when no other build qualifies: it can add a solid where there was none, never
+# replace an extrusion/stepped/turned build (and its exact cylinders) on the strength of a closer volume. Loft until
+# a corpus measurement says it can compete (2026-10-14).
+FALLBACK = {"loft"}
+
+
+def _better(label, m, best) -> bool:
+    if best is None:
+        return True
+    if (label in FALLBACK) != (best["method"] in FALLBACK):
+        return best["method"] in FALLBACK
+    return abs(m["dv_pct"]) < abs(best["dv_pct"])
+
+
 def choose(cands, n: int) -> dict | None:
     """The build reconstruct() would keep against an engine with n cylinders: in builder order, the qualifying
     one closest to the mesh volume (ties to the earlier builder)."""
     best = None
     for label, m in cands:
         if (m and acceptable(m) and m["cylinders"] > n and m.get("support", 0.0) >= MIN_SUPPORT
-                and (best is None or abs(m["dv_pct"]) < abs(best["dv_pct"]))):
+                and _better(label, m, best)):
             best = dict(m, method=label)
     return best
 
@@ -305,8 +319,7 @@ def reconstruct(stl, out, *, min_cylinders: int = 0, timeout: float = CANDIDATE_
                 if m is not None:
                     shutil.copyfile(produced, Path(keep) / f"{label}.step")
                 collected.append([label, {k: v for k, v in m.items() if k != "radii"} if m else None])
-            if (m and m.get("support", 0.0) >= MIN_SUPPORT
-                    and (best is None or abs(m["dv_pct"]) < abs(best["dv_pct"]))):
+            if m and m.get("support", 0.0) >= MIN_SUPPORT and _better(label, m, best):
                 best = dict(m, method=label)
                 shutil.copyfile(produced, wd / "best.step")
         if best and out is not None:
