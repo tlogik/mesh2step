@@ -175,8 +175,8 @@ export async function startGuide(ctx) {
     return (region && region.kind) || kind;
   }
 
-  async function enterStep() {
-    suggested = [];
+  async function enterStep(again) {
+    if (!again) suggested = [];       // a re-poll keeps the regions shown until the next set arrives
     updateUI();                       // the new step shows at once; suggestions arrive after the fetch
     if (step < steps.length) {
       const kind = steps[step][0];
@@ -193,8 +193,8 @@ export async function startGuide(ctx) {
         ? `${suggested.length} suggestion${suggested.length !== 1 ? 's' : ''}`
         : 'click or brush a surface to select it')
         + (pending ? ' \u2014 still finding surfaces in the scan, brush meanwhile' : '');
-      // a scan's surfaces are found in the background (minutes): ask again while this step is open
-      if (pending) { const s0 = step; setTimeout(() => { if (step === s0) enterStep(); }, 10000); }
+      // a scan's surfaces are found in the background and arrive largest first: ask again while this step is open
+      if (pending) { const s0 = step; setTimeout(() => { if (step === s0) enterStep(true); }, 3000); }
     }
     updateUI();
     recolour();
@@ -256,15 +256,12 @@ export async function startGuide(ctx) {
 
     for (const r of suggested) {
       if (r.triangles.includes(fi)) {
-        const already = selections.some(s => s.triangles.some(t => r.triangles.includes(t)));
-        if (already) {
-          selections = selections.filter(s => !s.triangles.some(t => r.triangles.includes(t)));
-        } else {
-          const selSet = new Set();
-          for (const s of selections) for (const t of s.triangles) selSet.add(t);
-          selections.push({ kind, surface: surfaceFor(kind, r), triangles: r.triangles.filter(t => !selSet.has(t)), params: r.params });
-          paramsEl.textContent = fmtParam(r);
-        }
+        // the clicked triangle is unselected (checked above): add the region's unselected rest. A scan's final
+        // regions can overlap one taken from an earlier, partial suggestion; that one is not undone by this click
+        const selSet = new Set();
+        for (const s of selections) for (const t of s.triangles) selSet.add(t);
+        selections.push({ kind, surface: surfaceFor(kind, r), triangles: r.triangles.filter(t => !selSet.has(t)), params: r.params });
+        paramsEl.textContent = fmtParam(r);
         recolour();
         return;
       }

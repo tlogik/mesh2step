@@ -14,7 +14,7 @@ upload [scan box ticked]
   -> token ------------------------------> browser opens the guided panel directly in scan mode
   -> detect (scanransac) in its own process, starts at once
                                           user brushes / clicks meanwhile (fit on the raw scan, ~1-3 s each)
-  -> GET suggest: detect regions only     (pending until detect is done)
+  -> GET suggest: detect regions only     (while detect runs: the regions accepted so far, largest first, 3 s poll)
   -> [gauge: 90-degree edges, branch scan/gauge, not merged: see below]
   -> POST build: cellbuild               surfaces -> cells -> inside vote -> one solid
   -> download STEP
@@ -28,7 +28,8 @@ conversion's output.
 ## Stage costs (nativedev, measured 2026-10-14)
 
 Total wait, upload to first suggestions: 21k scan ~590 s -> ~18 s; cam-gear ~935 s -> ~93 s; engine-piston
-~1430 s (+ conversion) -> ~159 s.
+~1430 s (+ conversion) -> ~159 s. With progressive suggestions, cam-gear (150k) end to end: token at 8 s, first curved
+suggestions at 12 s, 49 regions on screen at 46 s, final merged set at 65 s.
 
 | Stage | Before | Now | How |
 |---|---|---|---|
@@ -38,6 +39,7 @@ Total wait, upload to first suggestions: 21k scan ~590 s -> ~18 s; cam-gear ~935
 | detect, mechpart 25k | 94-121 s | 15.7 s | see detect below; all detect rows: shipped default, output identical to before |
 | detect, cam-gear 100k | 433 s (922 s under load) | 84 s (45 s analytic Jacobian, 23 s fast knobs) | |
 | detect, engine-piston 100k | 1408 s | 149 s | |
+| first suggestion, cam-gear | after detect (84 s) | 1.6 s into detect | detect publishes accepted regions (at most 1/s, then once before the merge) |
 | suggest poll, scan mode | 63 s of CAD fitting per pass, per 10 s poll, 0 useful regions | 0 | detect regions only |
 | mesh to browser, 100k | 9.0 MB JSON | 2.1 MB gzip | gzip on the guide mesh response |
 | cellbuild (30 parts, user labels) | median 9.9 s, p90 75 s, max 212 s | median 6.0, p90 27.5, max 57.5 s | inside vote screened by the tessellated cell; same 14/30 valid, same faces, per part |
@@ -84,9 +86,10 @@ algorithm with the 2-point Jacobian; `SCANRANSAC_ANALYTIC_JAC=1` halves detect a
    suggestions in scan mode, gzip mesh. Gate: scan API + browser tests, user-level eval not below the reference.
 2. **Pick the fast detect defaults by the eval**, not by time alone. Keep the fastest configuration whose
    user-level count (suggest + click + brush) is within noise of the exact one.
-3. **Progressive suggestions**: detect accepts regions largest-first; publish each round's regions (a small JSON
-   the suggest endpoint reads) so the big surfaces are suggested within seconds instead of at the end. The merge
-   pass then only refines what the user has not already accepted.
+3. **Progressive suggestions** (done): `detect(progress=path)` pickles the regions accepted so far (atomic rename),
+   the suggest endpoint serves them while detect is pending, the page re-polls every 3 s without clearing what it
+   shows. Output identical with and without publishing (`tests/test_scan_upload.py`). Open: the merge pass still
+   refits regions the user has already accepted.
 4. **cellbuild time**: profile the slow builds. Two classes seen: fragmented labels (82 cylinder labels on one
    part -> cell explosion, and those builds are invalid anyway: merge equal surfaces before MakerVolume) and few
    but expensive surfaces (91297: 23 faces, 212 s: profile MakerVolume vs inside vote vs UnifySameDomain).

@@ -55,3 +55,45 @@ def test_scan_upload_skips_the_cad_builders(scan_stl, monkeypatch):
     assert "scan" in job, "prep and detect must start at upload, not when the user finds the scan button"
     m = client.get(f"/api/guide/{tok}/mesh", params={"scan": "true"}).json()
     assert m["scan"] is True and m["n_triangles"] == len(job["scan"]["prep"].faces)
+
+
+def test_detect_publishes_progress_without_changing_its_answer(scan_stl, tmp_path):
+    """Progressive suggestions (bd projects-vgj7.2): detect publishes the regions it has accepted while it runs; the
+    publishing must not change what it returns."""
+    import pickle
+
+    import numpy as np
+    import trimesh
+
+    sys.path.insert(0, str(ROOT / "tools" / "feature_recon"))
+    from scanprep import prep
+    from scanransac import detect
+
+    pm = prep(trimesh.load(str(scan_stl), force="mesh"))[0]
+    prog = tmp_path / "det.pkl"
+    a, b = detect(pm), detect(pm, progress=str(prog))
+    assert np.array_equal(a["label"], b["label"]) and a["kinds"] == b["kinds"]
+    part = pickle.loads(prog.read_bytes())
+    assert len(part["kinds"]) and (part["label"] >= 0).any(), "the pre-merge regions were never published"
+
+
+def test_suggest_serves_partial_regions_while_detect_runs(scan_stl, tmp_path):
+    import pickle
+    from concurrent.futures import Future
+
+    import numpy as np
+
+    client = TestClient(server.app)
+    tok = _convert(client, scan_stl, scan="true")["download_token"]
+    sc = server._JOBS[tok]["scan"]
+    sc["det"].result()                      # let the real detect finish, then pretend it is still running
+    sc["det"] = Future()
+    lab = np.full(len(sc["prep"].faces), -1)
+    lab[:40] = 0
+    sc["prog"] = tmp_path / "p.pkl"
+    sc["prog"].write_bytes(pickle.dumps({"label": lab, "kinds": {0: "cylinder"},
+                                         "params": {0: {"axis": [0, 0, 1], "center": [0, 0, 0], "radius": 2.0}}}))
+    d = client.get(f"/api/guide/{tok}/suggest", params={"kind": "cylinder"}).json()
+    assert d["pending"] is True and d["regions"][0]["triangles"] == list(range(40)), d
+    sc["prog"] = tmp_path / "missing.pkl"   # nothing published yet: no regions, still pending
+    assert client.get(f"/api/guide/{tok}/suggest", params={"kind": "cylinder"}).json() == {"regions": [], "pending": True}

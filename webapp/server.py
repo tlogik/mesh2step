@@ -1821,8 +1821,9 @@ def _scan(job):
         pm.export(stl)
         from scanransac import detect
 
-        job["scan"] = {"raw": raw, "prep": pm, "stl": stl, "noise": _noise(raw.vertices, raw.faces),
-                       "det": _detect_async(detect, pm)}
+        prog = stl.with_suffix(".det.pkl")      # the regions detect has accepted so far, read while it runs
+        job["scan"] = {"raw": raw, "prep": pm, "stl": stl, "noise": _noise(raw.vertices, raw.faces), "prog": prog,
+                       "det": _detect_async(detect, pm, progress=str(prog))}
         job["tri"] = pm.triangles
         job.pop("suggest", None)
     return job["scan"]
@@ -1864,14 +1865,14 @@ def _new_scan_pool():
 _SCAN_POOL = None
 
 
-def _detect_async(fn, mesh):
+def _detect_async(fn, mesh, **kw):
     global _SCAN_POOL
     from concurrent.futures.process import BrokenProcessPool
 
     for _ in range(2):          # a worker killed (OOM, restart) breaks the pool for good: replace it once
         try:
             _SCAN_POOL = _SCAN_POOL or _new_scan_pool()
-            return _SCAN_POOL.submit(fn, mesh)
+            return _SCAN_POOL.submit(fn, mesh, **kw)
         except BrokenProcessPool:
             _SCAN_POOL = None
     raise RuntimeError("could not start surface detection")
@@ -1916,17 +1917,25 @@ def guide_suggest(token: str, kind: str):
 
         if kind not in guide.KINDS:
             raise HTTPException(400, f"unknown kind {kind!r}")
+        def regions(d):
+            lab = np.asarray(d["label"])
+            return [{"triangles": np.flatnonzero(lab == int(i)).tolist(), "surface": k, "kind": k,
+                     "params": _ui_params(k, d["params"][i])}
+                    for i, k in d["kinds"].items() if k == kind]
+
         det = job["scan"]["det"]
         if not det.done():
-            return {"regions": [], "pending": True}
+            # the regions accepted so far, largest first (cam-gear: the first at 1.6 s, all by 38 s, the merge to
+            # 84 s). Not cached: the next poll sees more, and the final merged set replaces them
+            try:
+                part = __import__("pickle").loads(job["scan"]["prog"].read_bytes())
+            except (OSError, EOFError):
+                part = None
+            return {"regions": regions(part) if part else [], "pending": True}
         if det.exception():      # no suggestions; the brush still works
             print(f"SRVSCAN detect failed: {det.exception()!r}", file=sys.stderr, flush=True)
             return {"regions": []}
-        d = det.result()
-        lab = np.asarray(d["label"])
-        cache[kind] = [{"triangles": np.flatnonzero(lab == int(i)).tolist(), "surface": k, "kind": k,
-                        "params": _ui_params(k, d["params"][i])}
-                       for i, k in d["kinds"].items() if k == kind]
+        cache[kind] = regions(det.result())
     if kind not in cache:
         try:
             cache[kind] = guide.suggest(tri, kind)

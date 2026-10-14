@@ -11,6 +11,7 @@ Kinds: plane, cylinder, cone, sphere, torus.
 """
 
 import os
+import time
 
 import numpy as np
 import scipy.optimize
@@ -36,6 +37,7 @@ N_TRIES = 5
 # ACCEPT_MAX = 1 is the original algorithm exactly. Env overrides for the A/B on tools/scanuser_eval.py
 ACCEPT_MAX = int(os.environ.get("SCANRANSAC_ACCEPT_MAX", "1"))
 ACCEPT_FRAC = float(os.environ.get("SCANRANSAC_ACCEPT_FRAC", "0.5"))
+PROGRESS_S = 1.0        # detect(progress=...): at most one publish per second during the rounds
 COMPLEXITY = {"plane": 0, "sphere": 1, "cylinder": 2, "cone": 3, "torus": 4}
 KINDS_ORDER = ["plane", "sphere", "cylinder", "cone", "torus"]
 
@@ -828,7 +830,21 @@ def _fill_gaps(label, kinds, params, C, fa):
     return label
 
 
-def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
+def _publish(path, label, kinds, params):
+    """The regions accepted so far, for a reader polling while detect runs (atomic: write, then rename)."""
+    import os
+    import pickle
+
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump({"label": label.copy(), "kinds": dict(kinds), "params": dict(params)}, f)
+    os.replace(tmp, path)
+
+
+def detect(mesh: trimesh.Trimesh, seed: int = 0, progress: str | None = None) -> dict:
+    """progress: a path the regions accepted so far are published to, every PROGRESS_S while the rounds run and once
+    before the merge. On cam-gear the first region is accepted at 1.6 s, the last at 38 s, the merge ends at 84 s:
+    the user sees the big surfaces at once instead of after the merge (bd projects-vgj7.2)."""
     # an STL loads as a triangle soup: no shared vertices, no adjacency, every component one triangle.
     # merge_vertices keeps the faces (and so the label order) as they are
     mesh = mesh.copy()
@@ -861,6 +877,7 @@ def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
     kinds = {}
     params = {}
     failed = 0
+    published = 0.0         # the first accepted region goes out at once
 
     for _ in range(MAX_ROUNDS):
         unassigned = np.where(label == -1)[0]
@@ -992,11 +1009,16 @@ def detect(mesh: trimesh.Trimesh, seed: int = 0) -> dict:
             if (label[best_comp] != -1).any():      # a region taken earlier this round reaches into it
                 continue
             accepted += _accept_region(best_kind, best_x, best_comp, label, kinds, params, F, V, C, N, fa, nf, eps, diag)
+        if accepted and progress and time.time() - published > PROGRESS_S:
+            _publish(progress, label, kinds, params)
+            published = time.time()
         if not accepted:
             failed += 1
             if failed >= MAX_FAILED:
                 break
 
+    if progress:
+        _publish(progress, label, kinds, params)
     # Merge fragments
     label, kinds, params = _merge_fragments(label, kinds, params, F, V, C, N, fa, eps, diag)
 
