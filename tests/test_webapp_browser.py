@@ -121,9 +121,9 @@ def test_a_circle_in_the_detection_gap_is_rebuilt_not_just_reported(browser, liv
     _wait_for_outcome(page)
 
     result = page.inner_text("#result-card")
-    assert "Ready to download" in result, result
+    assert "STEP file is ready" in result, result
     assert "round surface" in result, result          # it says what it rebuilt
-    warnings = page.inner_text("#warnings")
+    warnings = page.text_content("#warnings")
     assert "No curved surface was recovered" not in warnings, warnings
     assert "volume differs" not in warnings, warnings  # stale: describes the old result
     page.close()
@@ -146,7 +146,7 @@ def test_prism_rounded_into_a_cylinder_is_flagged(browser, live_url, tmp_path):
     page.select_option("#engine", "trueform")
     page.click("#convert-btn")
     _wait_for_outcome(page)
-    warnings = page.inner_text("#warnings")
+    warnings = page.text_content("#warnings")
     assert "changed the volume by" in warnings, warnings
     assert "11.07" in warnings, warnings
     page.close()
@@ -282,7 +282,7 @@ def test_an_oversized_model_is_refused_before_you_wait(browser, live_url, tmp_pa
     page.set_input_files("#file-input", str(big))
     page.wait_for_timeout(4000)
     assert page.locator("#convert-btn").is_disabled(), "oversized model must not be convertible"
-    warning = page.inner_text("#warnings")
+    warning = page.text_content("#warnings")
     assert "327,680" in warning and "120,000" in warning, warning
     assert "Simplify" in warning or "Decimate" in warning, warning
     page.close()

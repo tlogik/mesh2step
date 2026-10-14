@@ -139,6 +139,7 @@
 
     <aside id="settings-panel">
       <section class="panel-section primary">
+        <div id="choose-step">
         <label class="upload-btn">Choose a model…<input id="file-input-2" type="file" accept=".stl,.obj,.3mf,.ply" hidden /></label>
         <div id="input-name" class="active-map-name">No file chosen</div>
 
@@ -167,8 +168,14 @@
         <p class="primary-hint">Holes, round edges and flat walls come back as real CAD shapes you can measure and edit. Up to 250k triangles; bigger models can be reduced here first.</p>
 
         <div id="convert-status" class="convert-status hidden"></div>
-        <div id="result-card" class="result-card hidden"></div>
         <div id="warnings" class="warnings"></div>
+        </div>
+        <!-- after a conversion this is all the panel shows: one file, one download, one optional way to improve it -->
+        <div id="result-card" class="result-card hidden"></div>
+        <details id="result-details" class="advanced">
+          <summary>Details</summary>
+          <div id="stats-panel" class="stats-panel hidden"></div>
+        </details>
 
         <div class="brand-footer">
           <div class="tagline">From algorithm to physical object.</div>
@@ -258,10 +265,6 @@
           </select>
         </div>
       </section>
-        <section class="panel-section">
-          <h2>Details</h2>
-          <div id="stats-panel" class="stats-panel hidden"></div>
-        </section>
       </details>
     </aside>
   </main>

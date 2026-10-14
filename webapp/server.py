@@ -31,6 +31,7 @@ from mesh2step.io_mesh import SUPPORTED_EXTENSIONS, MeshLoadError, load_mesh
 from mesh2step.native import (
     NativeEngineError,
     NativeTimeout,
+    NativeCancelled,
     NativeUnavailable,
     convert_native,
     native_available,
@@ -636,23 +637,41 @@ def _feature_collect(stl_path, keep, phase_file):
     return proc.returncode == 0 and (Path(keep) / "cands.json").exists()
 
 
-def _feature_choose(keep, out_path) -> dict | None:
-    """_feature_upgrade's choice on builds already made: same rule, the engine STEP now at out_path."""
+def _feature_choose(keep, out_path, engine_step=True) -> dict | None:
+    """_feature_upgrade's choice on builds already made: same rule, the engine STEP now at out_path.
+    engine_step=False: chosen as against an engine with no cylinders, while the engine still writes out_path; the
+    build is left at res["output"] for the caller to move once the engine is stopped."""
     import subprocess
-    cand = Path(out_path).with_name("feature.step")
+    cand = Path(out_path).with_name("feature.step" if engine_step else "feature_early.step")
     try:
         r = subprocess.run([sys.executable, "-m", "mesh2step.feature", str(out_path), "-o", str(cand),
-                            "--choose", str(keep), "--engine-step", str(out_path)],
+                            "--choose", str(keep), *(["--engine-step", str(out_path)] if engine_step else [])],
                            capture_output=True, text=True, timeout=600)
     except (subprocess.TimeoutExpired, OSError):
         return None
     lines = [ln for ln in r.stdout.splitlines() if ln.startswith("RESULT ")]
     if r.returncode != 0 or not lines or not cand.exists():
         return None
-    cand.replace(out_path)
     res = json.loads(lines[-1][7:])
+    if not engine_step:
+        res["output"] = str(cand)
+        return res
+    cand.replace(out_path)
     res["output"] = str(out_path)
     return res
+
+
+def _feature_early(fb, out_path, engine_done) -> dict | None:
+    """Above EDGEBUILD_MAX_TRIS: the first qualifying feature build, chosen without the engine's cylinder count, so
+    the engine can be stopped. The engine only changes the choice when it builds at least as many cylinders as that
+    build; measured 2026-10-14 on 9 meshes of 65k-101k triangles it never did (engine 0-8 cylinders, builds 10-413)
+    and the same file was served, 2.5-11 minutes sooner (engine 77-709 s + 28-84 s re-read, builders 34-85 s).
+    None = the engine finished first: choose after it as before. False = no build qualifies even against no
+    cylinders, so none can against the engine's count either: the choice after the engine (its STEP re-read, 28-84 s
+    on these meshes) is skipped."""
+    if not fb[0].result() or engine_done.is_set():
+        return None
+    return _feature_choose(fb[1], out_path, engine_step=False) or False
 
 
 # A trueform STEP whose re-read volume is far off the mesh has a face that did not survive the
@@ -896,18 +915,33 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             _PREBUILT.setdefault(str(out_path), {})["fb"] = fb
         if progress is not None and str(out_path) in _PREBUILT:
             progress["par"] = str(out_path)
+        # a big mesh (no shape rebuild): a qualifying feature build stops the engine (_feature_early)
+        cancel = engine_done = early = None
+        if fb is not None and eb is None and (n_in_tris or 0) > EDGEBUILD_MAX_TRIS:
+            cancel, engine_done = threading.Event(), threading.Event()
+            early = ThreadPoolExecutor(1).submit(_feature_early, fb, out_path, engine_done)
+            early.add_done_callback(lambda f: f.result() and cancel.set())
         try:
             # skipped entirely for an oversize mesh: the engine is what cannot take it
             _stage(progress, "engine")
-            res = res if feature_only else convert_native(
-                stl_path, out_path,
-                engine=native_engine, schema=schema, unify_angle=native_unify,
-                no_unify=(engine == "faceted" and merge_coplanar_angle is None),
-                # the shorter engine cap only applies when the fallback can use the time it frees
-                timeout=(min(NATIVE_TIMEOUT_S, CONVERT_TIMEOUT_S)
-                         if engine == "trueform" and os.environ.get("MESH2STEP_ENGINE_FALLBACK") == "1"
-                         else CONVERT_TIMEOUT_S),
-            )
+            try:
+                res = res if feature_only else convert_native(
+                    stl_path, out_path,
+                    engine=native_engine, schema=schema, unify_angle=native_unify,
+                    no_unify=(engine == "faceted" and merge_coplanar_angle is None),
+                    # the shorter engine cap only applies when the fallback can use the time it frees
+                    timeout=(min(NATIVE_TIMEOUT_S, CONVERT_TIMEOUT_S)
+                             if engine == "trueform" and os.environ.get("MESH2STEP_ENGINE_FALLBACK") == "1"
+                             else CONVERT_TIMEOUT_S),
+                    cancel=cancel,
+                )
+            except NativeCancelled:
+                res = early.result()
+                Path(res["output"]).replace(out_path)
+                res["output"] = str(out_path)
+            finally:
+                if engine_done is not None:
+                    engine_done.set()
             if (engine == "trueform" and not res.get("ok")
                     and "post-write verification failed" in str(res.get("error") or "")):
                 # the engine skipped zero-area triangles of a watertight mesh and wrote an open shell, which re-reads
@@ -955,7 +989,8 @@ def _convert_in_worker(*, stl_path, out_path, workdir, engine, native_engine,
             _stage(progress, "edgebuild")
             res = _edgebuild_upgrade(stl_path, out_path, res)
         if (engine == "trueform" and res.get("ok") and not res.get("featureMethod")
-                and (feature or os.environ.get("MESH2STEP_FEATURE") == "1")):
+                and (feature or os.environ.get("MESH2STEP_FEATURE") == "1")
+                and not (early is not None and early.result() is False)):
             res = _feature_upgrade(stl_path, out_path, progress) or res
         if engine == "trueform" and res.get("ok") and not res.get("featureMethod"):
             _stage(progress, "retry")

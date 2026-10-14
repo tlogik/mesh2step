@@ -1,9 +1,9 @@
 // guided feature selection — written in M3 (see .claude/loopspec/guided-m3-guide-ui.spec.md)
 export async function startGuide(ctx) {
-  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls, scan } = ctx;
+  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls, scan, leave, newModel, onStop } = ctx;
   hideOthers();
-  // Make panel fixed on top of the canvas so buttons are clickable
-  panel.style.cssText = 'position:fixed;top:10px;right:10px;width:320px;z-index:99999;background:#fff;padding:10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);font-family:system-ui,sans-serif;font-size:14px;';
+  // in the side panel, in place of the conversion's controls (app.js setPhase 'guide'): nothing else on screen competes
+  panel.style.cssText = 'background:#fff;padding:10px;border-radius:8px;font-family:system-ui,sans-serif;font-size:14px;';
 
   let positions, centres, normals, brushR;
   const geo = new THREE.BufferGeometry();
@@ -83,8 +83,16 @@ export async function startGuide(ctx) {
     return e;
   }
 
-  const stepTitle = el('div', 'guide-step-title');
-  stepTitle.style.cssText = 'font-weight:600;font-size:15px;margin-bottom:6px;';
+  const LINK = 'padding:0;border:0;background:none;color:#2563eb;cursor:pointer;font-size:12px;text-decoration:underline;';
+  const head = row('display:flex;align-items:baseline;gap:8px;margin-bottom:6px;');
+  const stepTitle = el('div', 'guide-step-title', '', head);
+  stepTitle.style.cssText = 'font-weight:600;font-size:15px;flex:1;';
+  // the way out without building: back to the automatic file (a scan has none, so only a new model)
+  const leaveBtn = el('button', 'guide-leave', 'Cancel', head);
+  leaveBtn.style.cssText = LINK;
+  leaveBtn.title = 'Stop refining and keep the automatic file';
+  if (!leave) leaveBtn.style.display = 'none';
+  let closed = false, built = false;
   const paramsEl = el('div', 'guide-params');
   paramsEl.style.cssText = 'margin-bottom:8px;color:#444;';
   const acceptBtn = el('button', 'guide-accept-all', 'Accept all suggestions');
@@ -119,13 +127,16 @@ export async function startGuide(ctx) {
   buildBtn.style.cssText = PRIMARY + 'display:none;';
   const dl = el('a', 'guide-download', 'Download STEP', foot);
   dl.style.cssText = PRIMARY + 'display:none;';
+  const newBtn = el('button', 'guide-new', 'Convert another model');
+  newBtn.style.cssText = LINK + 'display:none;margin-top:8px;';
 
   // a scan declared at upload is already in scan mode; on a CAD conversion this is the way in for a scan the user
   // did not declare
   const scanBtn = el('button', 'guide-scan', 'This is a 3D scan');
   scanBtn.style.cssText = 'margin-top:8px;padding:0;border:0;background:none;color:#2563eb;cursor:pointer;font-size:12px;text-decoration:underline;';
   scanBtn.title = 'Denoise the mesh, suggest surfaces found in the scan, and fit painted areas on the raw scan';
-  if (scan) { scanBtn.disabled = true; scanBtn.textContent = '3D scan mode'; scanBtn.style.cssText += 'color:#888;text-decoration:none;cursor:default;'; }
+  // a scan declared at upload is in scan mode already: the link would only say so, and that does not help here
+  if (scan) scanBtn.remove();
 
   // --- helpers ---
   function recolour() {
@@ -180,8 +191,12 @@ export async function startGuide(ctx) {
 
   function updateUI() {
     const building = step >= steps.length;
+    built = false;                     // any move away from the built state makes its file stale
     stepTitle.textContent = building ? `Step ${N}/${N} \u2014 Build`
       : `Step ${step + 1}/${N} \u2014 ${steps[step][1]}`;
+    leaveBtn.style.display = leave ? '' : 'none';
+    newBtn.style.display = 'none';
+    statusEl.textContent = '';
     tools.style.display = legend.style.display = building ? 'none' : 'flex';
     if (building) {
       setBrush(false);
@@ -197,6 +212,7 @@ export async function startGuide(ctx) {
     buildBtn.style.display = building ? '' : 'none';
     dl.style.display = 'none';
     backBtn.style.visibility = step > 0 ? 'visible' : 'hidden';
+    undoBtn.style.display = building ? 'none' : '';     // nothing to undo on the Build step
   }
 
   function fmtParam(region) {
@@ -279,12 +295,14 @@ export async function startGuide(ctx) {
     brushBtn.style.color = on ? '#fff' : '';
   }
   canvas.addEventListener('mousedown', e => {
+    if (closed) return;
     pdX = e.clientX; pdY = e.clientY;
     if (brushing && step < steps.length) { painting = true; paintAt(e); }
   });
   canvas.addEventListener('mousemove', e => { if (painting) paintAt(e); });
 
   canvas.addEventListener('mouseup', async e => {
+    if (closed || built) return;
     if (painting) { painting = false; return; }
     if (Math.hypot(e.clientX - pdX, e.clientY - pdY) > 6) return;
     if (step >= steps.length) return;
@@ -406,7 +424,20 @@ export async function startGuide(ctx) {
   backBtn.addEventListener('click', () => { if (step > 0) { step--; enterStep(); } });
   nextBtn.addEventListener('click', () => { step++; enterStep(); });
 
+  // the guide off the page: its mesh, its panel and its canvas handlers (they check `closed`)
+  function stop() {
+    closed = true;
+    setBrush(false);
+    scene.remove(mesh);
+    panel.innerHTML = '';
+    delete window.__guide;
+  }
+  if (onStop) onStop(stop);
+  leaveBtn.addEventListener('click', () => { stop(); leave(); });
+  newBtn.addEventListener('click', () => newModel());
+
   buildBtn.addEventListener('click', async () => {
+    buildBtn.disabled = true;
     statusEl.style.color = '#555';
     statusEl.textContent = 'Rebuilding\u2026';
     try {
@@ -423,14 +454,21 @@ export async function startGuide(ctx) {
       }
       const data = await resp.json();
       showResult(data.token);
+      // done: the panel now says so and offers this file only (Back still revises it)
+      built = true;
+      stepTitle.textContent = 'Your improved STEP file is ready';
+      paramsEl.textContent = `${data.result.cylinders} cylinders, ${data.result.faces} faces in total.`;
+      statusEl.textContent = '';
+      leaveBtn.style.display = 'none';
+      newBtn.style.display = '';
       dl.href = `api/download/${data.token}`;
       dl.style.display = '';
       buildBtn.style.display = 'none';
-      statusEl.textContent = `Rebuilt: ${data.result.cylinders} cylinders, ${data.result.faces} faces`;
-      statusEl.style.color = '#15803d';      // the status line is red for errors only
     } catch (e) {
       statusEl.style.color = '#c00';
       statusEl.textContent = 'Error: ' + e.message;
+    } finally {
+      buildBtn.disabled = false;
     }
   });
 

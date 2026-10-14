@@ -73,10 +73,14 @@ def test_guided_fillet_to_step(live_url, tmp_path):
         page.click("#convert-btn")
         page.wait_for_function("() => { const r = document.getElementById('result-card');"
                                " return r && !r.classList.contains('hidden'); }", timeout=180000)
+        # the file phase: one download in the panel, the conversion controls gone
+        assert page.is_visible("#dl-main") and page.is_hidden("#convert-btn") and page.is_hidden("#preset")
+        page.click("#ready-close")
 
         page.click("#guide-start")
         page.wait_for_function("() => window.__guide && window.__guide.mesh && window.__guide.mesh.length > 0",
                                timeout=60000)
+        assert page.is_hidden("#dl-main"), "the automatic file's download must not compete with refining"
         for _ in range(8):
             if "Fillet" in page.inner_text("#guide-step-title"):
                 break
@@ -98,6 +102,8 @@ def test_guided_fillet_to_step(live_url, tmp_path):
             page.click("#guide-next")
         page.click("#guide-build")
         page.wait_for_selector("#guide-download", state="visible", timeout=600000)
+        assert "ready" in page.inner_text("#guide-step-title")
+        assert page.locator("#settings-panel :is(a, button):visible", has_text="Download").count() == 1
         href = page.get_attribute("#guide-download", "href")
         body = page.request.get(live_url.rstrip("/") + "/" + href.lstrip("/")).body()
         step = tmp_path / "guided.step"
@@ -201,7 +207,7 @@ def test_scan_declared_at_upload(live_url, tmp_path):
         page.wait_for_function("() => window.__guide && window.__guide.mesh && window.__guide.mesh.length > 0",
                                timeout=120000)
         assert time.time() - t < 60, "the guided step must open in seconds on a declared scan"
-        assert page.inner_text("#guide-scan") == "3D scan mode"
+        assert page.locator("#guide-scan").count() == 0      # already a scan: the link would only say so
         assert "Cylinder" in page.inner_text("#guide-step-title")
 
         stroke = page.evaluate(FILLET_STROKE_JS)

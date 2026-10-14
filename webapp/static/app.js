@@ -176,6 +176,9 @@ async function loadFile(file) {
     // the tolerance control is gone: the native engine does its own welding
   }
   inputName.textContent = file.name;
+  if (stopGuide) { stopGuide(); stopGuide = null; }
+  setPhase('choose');
+  document.getElementById('result-card').classList.add('hidden');
   document.getElementById('trim-enter').classList.remove('hidden');
   document.getElementById('stats-panel').classList.add('hidden');
   document.getElementById('warnings').innerHTML = '';
@@ -1147,6 +1150,13 @@ statusEl.addEventListener('click', () => { if (working && !workDialog.open) work
 const statsEl = document.getElementById('stats-panel');
 const resultEl = document.getElementById('result-card');
 const warningsEl = document.getElementById('warnings');
+// the panel shows one phase at a time (style.css): 'choose' a model, 'done' = its file, 'guide' = refining it by hand.
+// A conversion's notes belong to its file, so they move under that file's Details and back for the next model.
+function setPhase(p) {
+  document.body.dataset.phase = p;
+  const home = p === 'done' ? document.getElementById('result-details') : document.getElementById('convert-status').parentNode;
+  if (warningsEl.parentNode !== home) home.appendChild(warningsEl);
+}
 
 convertBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
@@ -1277,6 +1287,7 @@ async function waitForJob(job) {
 // A one-line status under the button was missed by people who had hidden the progress window:
 // a failure gets the same card a success does.
 function showFailure(msg) {
+  setPhase('choose');          // the options are what the user changes before trying again
   resultEl.innerHTML = '<div class="result-head bad">This model could not be converted</div>'
     + '<div class="result-line"></div>';
   resultEl.querySelector('.result-line').textContent = msg;
@@ -1300,6 +1311,7 @@ function renderResult(data) {
       + `<div class="result-line quiet">${s.n_prep_tris.toLocaleString()} triangles after cleanup · ${s.seconds.toFixed(1)}s</div>`
       + '<div id="guide-host"></div>';
     resultEl.classList.remove('hidden');
+    setPhase('guide');
     openGuide(data.download_token, true);
     return;
   }
@@ -1323,31 +1335,49 @@ function renderResult(data) {
   const secs = s.seconds ? `${s.seconds.toFixed(1)}s` : '';
   resultEl.innerHTML =
     `<div class="result-head ${s.is_solid ? 'good' : 'warn'}">`
-      + `${s.is_solid ? 'Ready to download' : 'Converted, but not a sealed solid'}</div>`
+      + `${s.is_solid ? 'Your STEP file is ready' : 'Your STEP file is ready, but it is not a sealed solid'}</div>`
     + lines.map((t) => `<div class="result-line">${t}</div>`).join('')
-    + `<div class="result-line quiet">${[kb, secs].filter(Boolean).join(' · ')}</div>`
-    + `<button class="download-btn" id="dl-main">Download ${s.output_path}</button>`
-    + `<button class="download-btn" id="guide-start">Refine features</button><div id="guide-host"></div>`;
+    + `<div class="result-line quiet">${[s.output_path, kb, secs].filter(Boolean).join(' · ')}</div>`
+    + '<button class="ready-download" id="dl-main">Download STEP</button>'
+    + '<div class="optional"><button class="secondary-btn" id="guide-start">Improve it by hand (optional)</button>'
+    + '<p class="hint">Pick the holes, round edges and fillets yourself, then build a new file.</p>'
+    + '<button class="secondary-btn" id="new-model">Convert another model</button></div>'
+    + '<div id="guide-host"></div>';
   resultEl.classList.remove('hidden');
+  setPhase('done');
   document.getElementById('dl-main').addEventListener('click', () => {
     // ponytail: relative URL so the app works behind the /mesh2step/ path prefix
     window.location.href = `api/download/${data.download_token}`;
   });
-  // guided feature selection (owner 2026-10-12): the user picks features kind by kind, no AI
+  // guided feature selection (owner 2026-10-12): the user picks features kind by kind, no AI.
+  // While refining, this file and its download are out of sight: the guide ends with its own file
   document.getElementById('guide-start').addEventListener('click', (e) => {
     e.target.disabled = true;
     readyDialog.close();
+    setPhase('guide');
     openGuide(data.download_token, false);
   });
+  document.getElementById('new-model').addEventListener('click', () => document.getElementById('file-input-2').click());
   renderStats(data);
   showResultPreview(data.download_token);
   showReady(data.download_token, s.is_solid ? 'File ready!' : 'File ready, but not a sealed solid',
             (lines.join('. ') || 'Your part was converted') + '.');
 }
 
+let stopGuide = null;      // set while a guide is on the page: a new model takes it off
 async function openGuide(token, scan) {
+  if (stopGuide) { stopGuide(); stopGuide = null; }
   const { startGuide } = await import('./guide.js');
   startGuide({
+    // Cancel: back to the automatic file as it was (a scan has no automatic file, only a new model)
+    leave: scan ? null : () => {
+      setPhase('done');
+      document.getElementById('guide-start').disabled = false;
+      viewSelect.disabled = false;
+      showResultPreview(token);
+    },
+    newModel: () => document.getElementById('file-input-2').click(),
+    onStop: (f) => { stopGuide = f; },
     THREE, scene, camera, canvas, controls, token, scan,
     panel: document.getElementById('guide-host'),
     hideOthers: () => {

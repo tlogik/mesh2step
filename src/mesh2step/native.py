@@ -36,6 +36,10 @@ class NativeTimeout(NativeEngineError):
         super().__init__(f"stl2step exceeded the {seconds}s timeout")
 
 
+class NativeCancelled(NativeEngineError):
+    """The caller stopped the engine (convert_native's `cancel` was set): its output is not wanted."""
+
+
 class NativeParseError(NativeEngineError):
     def __init__(self, stdout: str) -> None:
         super().__init__(f"stl2step emitted no RESULT line (stdout: {stdout.strip()[-400:]!r})")
@@ -75,6 +79,7 @@ def convert_native(
     smooth_tol: float | None = None,
     smooth_angle: float | None = None,
     force_sew: bool = False,
+    cancel=None,
 ) -> dict:
     binary = native_binary()
     if binary is None:
@@ -113,12 +118,33 @@ def convert_native(
         cmd += ["--force-sew"]
 
     seconds = timeout if timeout is not None else _DEFAULT_TIMEOUT
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds)
-    except subprocess.TimeoutExpired:
-        raise NativeTimeout(seconds) from None
+    if cancel is None:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=seconds)
+        except subprocess.TimeoutExpired:
+            raise NativeTimeout(seconds) from None
+        stdout = proc.stdout
+    else:
+        # cancel (a threading.Event): checked once a second; its own session, so the engine's forked solver goes too
+        import os
+        import signal
+        import time
 
-    result = _parse_result(proc.stdout)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        end = time.monotonic() + seconds
+        while True:
+            try:
+                stdout, _ = proc.communicate(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                if cancel.is_set() or time.monotonic() > end:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.communicate()
+                    if cancel.is_set():
+                        raise NativeCancelled() from None
+                    raise NativeTimeout(seconds) from None
+
+    result = _parse_result(stdout)
     result["exit_code"] = proc.returncode
     return result
 

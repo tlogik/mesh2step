@@ -65,3 +65,18 @@ def test_import_does_not_pull_refit():
 
     with pytest.raises(ImportError):
         importlib.import_module("mesh2step.refit")
+
+
+def test_convert_native_cancel_stops_the_engine(tmp_path):
+    """cancel set: the engine is killed within about a second and the caller hears NativeCancelled."""
+    import threading
+    import time
+
+    from mesh2step.native import NativeCancelled
+
+    cancel = threading.Event()
+    threading.Timer(1.5, cancel.set).start()
+    t = time.time()
+    with pytest.raises(NativeCancelled):
+        convert_native(CORPUS / "Body11.stl", tmp_path / "b.step", engine="trueform", cancel=cancel)
+    assert time.time() - t < 5

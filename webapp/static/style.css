@@ -406,3 +406,13 @@ select {
 .ready-download:hover { background: #15803d; }
 .convert-status.busy { cursor: pointer; }
 .scan-toggle { margin: 8px 0 4px; }
+
+/* --- one phase on screen: choose a model, then the file, then (optional) refining it by hand --- */
+#result-details { display: none; }
+body[data-phase=done] #choose-step, body[data-phase=guide] #choose-step,
+body[data-phase=done] #advanced, body[data-phase=guide] #advanced { display: none; }
+body[data-phase=done] #result-details { display: block; }
+body[data-phase=guide] #result-card > :not(#guide-host) { display: none; }
+body[data-phase=guide] #result-card { padding: 0; border: 0; background: none; margin-top: 0; }
+.result-card .optional { margin-top: 18px; padding-top: 12px; border-top: 1px solid var(--border); }
+.result-card .optional .hint { margin: 4px 2px 0; font-size: 11.5px; opacity: 0.6; line-height: 1.45; }
