@@ -212,12 +212,16 @@ def cells(faces, lo, hi, fuzzy):
 def _closed_mesh(s, defl):
     """The cell tessellated (BRepMesh) as a closed trimesh, or None when it does not close."""
     from OCP.BRep import BRep_Tool
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
     from OCP.TopExp import TopExp_Explorer
     from OCP.TopLoc import TopLoc_Location
     from OCP.TopoDS import TopoDS
 
+    # a copy: meshing attaches triangulations to the faces it meshes, and the exact classifier run on the cell
+    # afterwards then answers differently (plate scan: the user's r4 fillet cell flipped and the fillet was lost)
+    s = BRepBuilderAPI_Copy(s).Shape()
     BRepMesh_IncrementalMesh(s, defl, False, 0.5, True)
     pos, ex = [], TopExp_Explorer(s, TopAbs_FACE)
     while ex.More():
