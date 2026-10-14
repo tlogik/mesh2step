@@ -250,6 +250,6 @@ def test_accept_all_answers_in_the_dialog(live_url, tmp_path):
         assert "press Next" in page.inner_text("#guide-params")
         page.click("#guide-next")
         page.wait_for_function("() => !document.getElementById('guide-accept-all').disabled", timeout=60000)
-        assert page.inner_text("#guide-accept-all") == "Accept all suggestions"
+        assert page.inner_text("#guide-accept-all").startswith("Accept all suggestions")
         assert errors == [], errors
         b.close()

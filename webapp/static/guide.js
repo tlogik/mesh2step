@@ -3,7 +3,7 @@ export async function startGuide(ctx) {
   const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls, scan } = ctx;
   hideOthers();
   // Make panel fixed on top of the canvas so buttons are clickable
-  panel.style.cssText = 'position:fixed;top:10px;right:10px;width:280px;z-index:99999;background:#fff;padding:10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);font-family:system-ui,sans-serif;font-size:14px;';
+  panel.style.cssText = 'position:fixed;top:10px;right:10px;width:320px;z-index:99999;background:#fff;padding:10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);font-family:system-ui,sans-serif;font-size:14px;';
 
   let positions, centres, normals, brushR;
   const geo = new THREE.BufferGeometry();
@@ -56,45 +56,76 @@ export async function startGuide(ctx) {
   let painted = new Set();
 
   // --- UI ---
+  // one column: what this step found, how to take it, how to add what it missed; the way on is always the green
+  // button bottom right (Next, then Build, then Download)
   const wrap = document.createElement('div');
   wrap.id = 'guide-panel';
-  wrap.style.cssText = 'padding:8px;font-family:system-ui,sans-serif;font-size:14px;';
+  wrap.style.cssText = 'padding:4px;font-family:system-ui,sans-serif;font-size:14px;color:#222;';
   panel.appendChild(wrap);
+  const css = document.createElement('style');
+  css.textContent = '#guide-panel button:disabled{opacity:.45;cursor:default}';
+  wrap.appendChild(css);
 
-  function el(tag, id, text) {
+  const BTN = 'padding:5px 10px;cursor:pointer;border:1px solid #ccc;border-radius:6px;background:#f6f6f8;color:#222;font-size:13px;';
+  const PRIMARY = 'padding:7px 14px;cursor:pointer;border:0;border-radius:6px;background:#16a34a;color:#fff;font-weight:600;font-size:14px;text-decoration:none;';
+  function row(css, parent = wrap) {
+    const d = document.createElement('div');
+    d.style.cssText = css;
+    parent.appendChild(d);
+    return d;
+  }
+  function el(tag, id, text, parent = wrap) {
     const e = document.createElement(tag);
     e.id = id;
     if (text) e.textContent = text;
-    if (tag === 'button') e.style.cssText = 'margin:2px 4px 2px 0;padding:4px 10px;cursor:pointer;';
-    wrap.appendChild(e);
+    if (tag === 'button') e.style.cssText = BTN;
+    parent.appendChild(e);
     return e;
   }
 
   const stepTitle = el('div', 'guide-step-title');
-  stepTitle.style.cssText = 'font-weight:600;margin-bottom:4px;';
+  stepTitle.style.cssText = 'font-weight:600;font-size:15px;margin-bottom:6px;';
   const paramsEl = el('div', 'guide-params');
-  paramsEl.style.cssText = 'margin-bottom:6px;color:#555;';
+  paramsEl.style.cssText = 'margin-bottom:8px;color:#444;';
   const acceptBtn = el('button', 'guide-accept-all', 'Accept all suggestions');
-  const undoBtn = el('button', 'guide-undo', 'Undo');
-  const skipBtn = el('button', 'guide-skip', 'Skip');
-  const nextBtn = el('button', 'guide-next', 'Next');
-  const buildBtn = el('button', 'guide-build', 'Build STEP');
-  buildBtn.style.display = 'none';
-  const scanBtn = el('button', 'guide-scan', 'This is a 3D scan');
-  scanBtn.title = 'Denoise the mesh, suggest surfaces found in the scan, and fit brushed areas on the raw scan';
-  if (scan) { scanBtn.disabled = true; scanBtn.textContent = '3D scan mode'; }
-  const brushBtn = el('button', 'guide-brush', 'Brush');
-  brushBtn.title = 'Paint a face (drag), then Fit: the surface of the current kind through the painted area';
-  const brushSize = el('input', 'guide-brush-size');
+  acceptBtn.style.cssText = BTN + 'width:100%;margin-bottom:8px;';
+
+  const tools = row('display:flex;align-items:center;gap:6px;margin-bottom:6px;');
+  el('span', 'guide-missed', 'Missing one?', tools).style.cssText = 'color:#666;font-size:13px;';
+  const brushBtn = el('button', 'guide-brush', 'Paint', tools);
+  brushBtn.title = 'Drag over a surface the suggestions missed, then Fit';
+  const brushSize = el('input', 'guide-brush-size', '', tools);
   brushSize.type = 'range'; brushSize.min = '0.25'; brushSize.max = '4'; brushSize.step = '0.25'; brushSize.value = '1';
   brushSize.title = 'Brush size';
-  brushSize.style.cssText = 'width:80px;vertical-align:middle;';
-  const fitBtn = el('button', 'guide-fit', 'Fit painted');
-  const clearBtn = el('button', 'guide-clear', 'Clear paint');
+  brushSize.style.cssText = 'width:70px;';
+  const fitBtn = el('button', 'guide-fit', 'Fit', tools);
+  fitBtn.title = 'Fit the surface of this step through the painted area';
+
+  const legend = row('display:flex;gap:10px;font-size:12px;color:#666;margin-bottom:4px;');
+  for (const [c, t] of [['#f59e0b', 'suggested'], ['#4ade80', 'selected'], ['#3b82f6', 'painted']]) {
+    row('display:flex;align-items:center;gap:4px;', legend).innerHTML = `<span style="width:10px;height:10px;border-radius:2px;background:${c};display:inline-block"></span>${t}`;
+  }
   const statusEl = el('div', 'guide-status');
-  statusEl.style.cssText = 'margin-top:6px;color:#c00;min-height:1.2em;';
-  const dl = el('a', 'guide-download', 'Download refined STEP');
-  dl.style.cssText = 'display:none;margin-top:6px;';
+  statusEl.style.cssText = 'color:#c00;font-size:13px;margin:2px 0;';
+
+  const foot = row('display:flex;align-items:center;gap:6px;border-top:1px solid #eee;padding-top:8px;margin-top:4px;');
+  const backBtn = el('button', 'guide-back', '← Back', foot);
+  const undoBtn = el('button', 'guide-undo', 'Undo', foot);
+  undoBtn.title = 'Clear the paint, or remove the last selection';
+  row('flex:1', foot);
+  const nextBtn = el('button', 'guide-next', 'Next', foot);
+  nextBtn.style.cssText = PRIMARY;
+  const buildBtn = el('button', 'guide-build', 'Build STEP', foot);
+  buildBtn.style.cssText = PRIMARY + 'display:none;';
+  const dl = el('a', 'guide-download', 'Download STEP', foot);
+  dl.style.cssText = PRIMARY + 'display:none;';
+
+  // a scan declared at upload is already in scan mode; on a CAD conversion this is the way in for a scan the user
+  // did not declare
+  const scanBtn = el('button', 'guide-scan', 'This is a 3D scan');
+  scanBtn.style.cssText = 'margin-top:8px;padding:0;border:0;background:none;color:#2563eb;cursor:pointer;font-size:12px;text-decoration:underline;';
+  scanBtn.title = 'Denoise the mesh, suggest surfaces found in the scan, and fit painted areas on the raw scan';
+  if (scan) { scanBtn.disabled = true; scanBtn.textContent = '3D scan mode'; scanBtn.style.cssText += 'color:#888;text-decoration:none;cursor:default;'; }
 
   // --- helpers ---
   function recolour() {
@@ -140,30 +171,32 @@ export async function startGuide(ctx) {
     for (const s of selections) for (const t of s.triangles) selSet.add(t);
     const done = suggested.length > 0 && suggested.every(r => r.triangles.some(t => selSet.has(t)));
     acceptBtn.disabled = done;
-    acceptBtn.textContent = done ? 'All suggestions accepted \u2713' : 'Accept all suggestions';
-    nextBtn.style.background = done ? '#3b82f6' : '';
-    nextBtn.style.color = done ? '#fff' : '';
+    acceptBtn.textContent = done ? 'All suggestions accepted \u2713'
+      : `Accept all suggestions (${suggested.length})`;
+    acceptBtn.style.display = step < steps.length && suggested.length ? '' : 'none';
+    fitBtn.disabled = !painted.size;
+    undoBtn.disabled = !painted.size && !selections.length;
   }
 
   function updateUI() {
-    if (step < steps.length) {
-      stepTitle.textContent = `Step ${step + 1}/${N} \u2014 ${steps[step][1]}`;
-      buildBtn.style.display = 'none';
-      acceptBtn.style.display = '';
-      undoBtn.style.display = '';
-      skipBtn.style.display = '';
-      nextBtn.style.display = '';
-      for (const b of [brushBtn, brushSize, fitBtn, clearBtn]) b.style.display = '';
-    } else {
-      for (const b of [brushBtn, brushSize, fitBtn, clearBtn]) b.style.display = 'none';
+    const building = step >= steps.length;
+    stepTitle.textContent = building ? `Step ${N}/${N} \u2014 Build`
+      : `Step ${step + 1}/${N} \u2014 ${steps[step][1]}`;
+    tools.style.display = legend.style.display = building ? 'none' : 'flex';
+    if (building) {
       setBrush(false);
-      stepTitle.textContent = `Step ${N}/${N} \u2014 Build`;
-      buildBtn.style.display = '';
       acceptBtn.style.display = 'none';
-      undoBtn.style.display = '';
-      skipBtn.style.display = 'none';
-      nextBtn.style.display = 'none';
+      const n = selections.length;
+      paramsEl.textContent = n ? `${n} surface${n !== 1 ? 's' : ''} selected. Build turns them into exact faces.`
+        : 'Nothing selected: the build uses the automatic result.';
     }
+    nextBtn.style.display = building ? 'none' : '';
+    nextBtn.textContent = 'Next \u2192';
+    nextBtn.title = step + 1 < steps.length ? `Next: ${steps[step + 1][1]}` : 'Next: Build';
+    scanBtn.style.display = building ? 'none' : '';
+    buildBtn.style.display = building ? '' : 'none';
+    dl.style.display = 'none';
+    backBtn.style.visibility = step > 0 ? 'visible' : 'hidden';
   }
 
   function fmtParam(region) {
@@ -188,6 +221,7 @@ export async function startGuide(ctx) {
   }
 
   async function enterStep(again) {
+    statusEl.style.color = '#c00';
     if (!again) suggested = [];       // a re-poll keeps the regions shown until the next set arrives
     updateUI();                       // the new step shows at once; suggestions arrive after the fetch
     if (step < steps.length) {
@@ -201,10 +235,11 @@ export async function startGuide(ctx) {
           pending = !!data.pending;
         }
       } catch (_) { /* ignore */ }
+      const what = steps[step][1].toLowerCase();
       paramsEl.textContent = (suggested.length
-        ? `${suggested.length} suggestion${suggested.length !== 1 ? 's' : ''}`
-        : 'click or brush a surface to select it')
-        + (pending ? ' \u2014 still finding surfaces in the scan, brush meanwhile' : '');
+        ? `${suggested.length} suggestion${suggested.length !== 1 ? 's' : ''} in orange: click one to take it, or accept all.`
+        : `No ${what} found. If the part has one, click it or paint it; otherwise go on.`)
+        + (pending ? ' Still searching the scan\u2026' : '');
       // a scan's surfaces are found in the background and arrive largest first: ask again while this step is open
       if (pending) { const s0 = step; setTimeout(() => { if (step === s0) enterStep(true); }, 3000); }
     }
@@ -336,7 +371,6 @@ export async function startGuide(ctx) {
   });
 
   brushBtn.addEventListener('click', () => setBrush(!brushing));
-  clearBtn.addEventListener('click', () => { painted = new Set(); recolour(); });
 
   fitBtn.addEventListener('click', async () => {
     if (step >= steps.length || !painted.size) { statusEl.textContent = 'paint a face first'; return; }
@@ -364,13 +398,16 @@ export async function startGuide(ctx) {
   });
 
   undoBtn.addEventListener('click', () => {
-    if (selections.length) { selections.pop(); recolour(); }
+    if (painted.size) painted = new Set();
+    else if (selections.length) selections.pop();
+    recolour();
   });
 
-  skipBtn.addEventListener('click', () => { step++; enterStep(); });
+  backBtn.addEventListener('click', () => { if (step > 0) { step--; enterStep(); } });
   nextBtn.addEventListener('click', () => { step++; enterStep(); });
 
   buildBtn.addEventListener('click', async () => {
+    statusEl.style.color = '#555';
     statusEl.textContent = 'Rebuilding\u2026';
     try {
       const resp = await fetch(`api/guide/${token}/build`, {
@@ -380,6 +417,7 @@ export async function startGuide(ctx) {
       });
       if (!resp.ok) {
         const err = await resp.json();
+        statusEl.style.color = '#c00';
         statusEl.textContent = err.detail || 'Build failed';
         return;
       }
@@ -387,8 +425,11 @@ export async function startGuide(ctx) {
       showResult(data.token);
       dl.href = `api/download/${data.token}`;
       dl.style.display = '';
+      buildBtn.style.display = 'none';
       statusEl.textContent = `Rebuilt: ${data.result.cylinders} cylinders, ${data.result.faces} faces`;
+      statusEl.style.color = '#15803d';      // the status line is red for errors only
     } catch (e) {
+      statusEl.style.color = '#c00';
       statusEl.textContent = 'Error: ' + e.message;
     }
   });
