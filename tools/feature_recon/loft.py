@@ -576,6 +576,14 @@ def main():
     diag = float(np.linalg.norm(hi - lo))
     auto2d.LINE_TOL = auto2d.ARC_TOL = max(0.02, 2e-4 * diag)
     tol = 2 * auto2d.LINE_TOL
+    # 0. a scan has no flat faces to slice between: its largest normal bin holds <= 11% of the area (realworld 150k
+    # scans; they burned the whole budget, 110-235 s in the plane choice alone), every part loft builds acceptably
+    # >= 28% (corpus c40caa8, 2026-10-14). Triangle count did not separate them (mechparts/6: 100k, needs 178 s)
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]); a = np.linalg.norm(n, axis=1)
+    _, inv = np.unique(np.round(np.abs(n / np.maximum(a[:, None], 1e-300)), 2), axis=0, return_inverse=True)
+    flat = np.bincount(inv.ravel(), a).max() / a.sum()
+    if flat < float(os.environ.get("LOFT_MIN_FLAT", "0.18")):
+        print("largest flat %.2f of the area: no planes to slice between, not lofted" % flat); return 2
     # 1. the slicing plane; the mesh turned so its normal is Z
     if os.environ.get("AXIS") in ("0", "1", "2"):
         F = frame(np.eye(3)[int(os.environ["AXIS"])]); t = tri @ F.T
