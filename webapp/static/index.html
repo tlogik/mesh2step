@@ -277,6 +277,13 @@
       you keep this tab open: the server keeps working and this window updates by itself.</p>
     <button id="work-hide" type="button" class="secondary-btn">Hide — keep working in the background</button>
   </dialog>
+  <!-- the end of a conversion or a guided build: one obvious way to the file. Not modal: the page stays usable -->
+  <dialog id="ready-dialog" class="work-modal ready-modal" aria-labelledby="ready-title" aria-describedby="ready-detail">
+    <h2 id="ready-title" class="modal-title">File ready!</h2>
+    <p id="ready-detail" class="modal-tagline"></p>
+    <button id="ready-download" type="button" class="ready-download">Download STEP</button>
+    <button id="ready-close" type="button" class="secondary-btn">Close</button>
+  </dialog>
 
   <div id="welcome-overlay" class="modal-overlay hidden">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="welcome-title">

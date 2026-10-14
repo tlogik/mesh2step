@@ -1078,6 +1078,7 @@ function openWork() {
     if (!workData && secs >= 2) workStep.textContent = 'Working on your model on the server…';
     showTime(secs);
   }, 1000);
+  if (readyDialog.open) readyDialog.close();      // a new conversion: the last one's file is not this one
   if (!workDialog.open) workDialog.showModal();
 }
 
@@ -1112,6 +1113,21 @@ function updateWork(data, secs, note) {
   }
   showTime(Math.round((Date.now() - workStarted) / 1000));
 }
+
+// ---- the file is ready: say so where the user looks, with the download one click away ----
+const readyDialog = document.getElementById('ready-dialog');
+let readyHref = '';
+function showReady(token, title, detail) {
+  readyHref = `api/download/${token}`;    // relative: the app runs behind the /mesh2step/ prefix
+  document.getElementById('ready-title').textContent = title;
+  document.getElementById('ready-detail').textContent = detail;
+  if (!readyDialog.open) readyDialog.show();
+}
+document.getElementById('ready-download').addEventListener('click', () => {
+  window.location.href = readyHref;
+  readyDialog.close();
+});
+document.getElementById('ready-close').addEventListener('click', () => readyDialog.close());
 
 function closeWork() {
   working = false;
@@ -1320,10 +1336,13 @@ function renderResult(data) {
   // guided feature selection (owner 2026-10-12): the user picks features kind by kind, no AI
   document.getElementById('guide-start').addEventListener('click', (e) => {
     e.target.disabled = true;
+    readyDialog.close();
     openGuide(data.download_token, false);
   });
   renderStats(data);
   showResultPreview(data.download_token);
+  showReady(data.download_token, s.is_solid ? 'File ready!' : 'File ready, but not a sealed solid',
+            (lines.join('. ') || 'Your part was converted') + '.');
 }
 
 async function openGuide(token, scan) {
@@ -1335,7 +1354,10 @@ async function openGuide(token, scan) {
       for (const o of [currentMesh, resultMesh, resultEdges, leftoverMesh]) if (o) o.visible = false;
       viewSelect.disabled = true;
     },
-    showResult: (tok) => showResultPreview(tok),
+    showResult: (tok) => {
+      showResultPreview(tok);
+      showReady(tok, 'File ready!', 'Your part was rebuilt with the surfaces you picked.');
+    },
   });
 }
 

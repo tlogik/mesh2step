@@ -253,3 +253,30 @@ def test_accept_all_answers_in_the_dialog(live_url, tmp_path):
         assert page.inner_text("#guide-accept-all").startswith("Accept all suggestions")
         assert errors == [], errors
         b.close()
+
+
+def test_file_ready_dialog_downloads_the_step(live_url, tmp_path):
+    """A finished conversion says "File ready!" with the download one click away (owner, 2026-10-14)."""
+    mesh, _, _, _ = G.tessellate(G.part())
+    stl = tmp_path / "plate.stl"
+    mesh.export(str(stl))
+    with playwright_api.sync_playwright() as pw:
+        b = pw.chromium.launch(args=["--use-gl=swiftshader", "--enable-unsafe-swiftshader"])
+        page = b.new_page(viewport={"width": 1280, "height": 900})
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(live_url, wait_until="networkidle", timeout=60000)
+        page.evaluate("document.getElementById('welcome-overlay').classList.add('hidden')")
+        page.set_input_files("#file-input", str(stl))
+        page.wait_for_timeout(1500)
+        page.click("#convert-btn")
+        page.wait_for_selector("#ready-dialog[open]", timeout=180000)
+        assert page.inner_text("#ready-title") == "File ready!"
+        with page.expect_download() as dl:
+            page.click("#ready-download")
+        step = tmp_path / "out.step"
+        dl.value.save_as(step)
+        assert step.read_text()[:13] == "ISO-10303-21;"
+        assert not page.is_visible("#ready-dialog")
+        assert errors == [], errors
+        b.close()
