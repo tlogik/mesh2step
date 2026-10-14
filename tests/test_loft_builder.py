@@ -58,6 +58,31 @@ def test_loft_builds_the_frustum_and_keeps_the_bore_exact(tmp_path):
     assert _p95_mesh_to_model(mesh, back) <= 0.03
 
 
+def test_loft_finds_the_plane_of_a_tilted_part(tmp_path):
+    """the same part turned 23 deg about X and 37 deg about Z: the slicing plane is the frustum's axis, not a world
+    axis, and the build is as good as upright."""
+    import math
+
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Ax1, gp_Dir, gp_Pnt, gp_Trsf
+
+    a, b = gp_Trsf(), gp_Trsf()
+    a.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), math.radians(23))
+    b.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), math.radians(37))
+    shape = BRepBuilderAPI_Transform(_part(), b.Multiplied(a), True).Shape()
+    mesh, _, _, _ = G.tessellate(shape, lin=0.01, ang=0.1)
+    stl, out = tmp_path / "tilted.stl", tmp_path / "loft.step"
+    mesh.export(str(stl))
+    r = subprocess.run([sys.executable, str(LOFT), str(stl), str(out)], capture_output=True, text=True, timeout=900)
+    assert r.returncode == 0 and out.exists(), r.stdout[-2000:] + r.stderr[-2000:]
+    back, faces, nsol, valid = G.read_step(out)
+    assert nsol == 1 and valid, faces
+    assert abs(G.volume(back) - G.volume(shape)) / G.volume(shape) <= 0.005
+    assert any(k == "cylinder" and abs(rad - 4) <= 0.04 for k, rad in faces), faces
+    assert len(faces) <= 30, faces
+    assert _p95_mesh_to_model(mesh, back) <= 0.03
+
+
 def test_loft_is_a_feature_candidate(tmp_path):
     sys.path.insert(0, str(ROOT / "src"))
     from mesh2step.feature import _candidates

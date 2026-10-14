@@ -1,6 +1,8 @@
 """Slice and loft: the stepped builder's slicing plane, with the sections that change gradually lofted instead of
 stacked as thin prisms.
-1. axis (the slicing plane) as auto25g chooses it;
+1. the slicing plane (choose_plane): among X, Y, Z and the normals of the largest flat regions, the one whose
+   slabs keep a constant set of loops over the most height, then the most flat area square to it; the mesh is
+   turned so that plane's normal is Z, built there, and the solid turned back;
 2. slabs between the heights of the horizontal faces (shoulders, pockets, end faces);
 3. per slab, sections at K heights; a loop that stays put is a prism of its exact lines and arcs (a bore stays a
    cylinder); a loop that changes is lofted through its sections, every section split at the same M rail points,
@@ -18,9 +20,10 @@ import numpy as np
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 import auto2d
 from auto2d import loop_area, segment_loop, build_wire, to3d
-from auto25g import levels_for_axis, build_level, finish
+from auto25g import build_level, finish
 from slice import load, loops, dedupe
-from OCP.gp import gp_Vec
+from OCP.gp import gp_Vec, gp_Trsf
+from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
 from OCP.TColgp import TColgp_HArray1OfPnt
 from OCP.GeomAPI import GeomAPI_Interpolate
 from OCP.BRepBuilderAPI import (BRepBuilderAPI_MakeEdge, BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakeVertex,
@@ -260,43 +263,96 @@ def build_slab(tri, ax, z0, z1, step, k):
     return solids
 
 
+def frame(d):
+    """orthonormal (u, v, d) with d the slicing normal; a world axis keeps the world axes (exact as before)"""
+    d = d / np.linalg.norm(d)
+    for i in range(3):
+        if abs(abs(d[i]) - 1) < 1e-12:
+            u, v = np.eye(3)[(i + 1) % 3], np.eye(3)[(i + 2) % 3]
+            return np.array([u, v, np.eye(3)[i]])
+    u = np.cross(d, np.eye(3)[int(np.argmin(np.abs(d)))]); u /= np.linalg.norm(u)
+    return np.array([u, np.cross(d, u), d])
+
+
+def slabs_of(tri):
+    """slabs along Z: between the heights of the faces square to Z; and the area of those faces"""
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    area = np.linalg.norm(n, axis=1)
+    flat = np.abs(n[:, 2]) > 0.99 * np.maximum(area, 1e-300)
+    lo, hi = tri[:, :, 2].min(), tri[:, :, 2].max()
+    tot = {}
+    for h, a in zip(np.round(tri[flat][:, :, 2].mean(1), 3), area[flat]):
+        tot[h] = tot.get(h, 0.0) + a
+    big = max(tot.values()) if tot else 0.0
+    inner = sorted(h for h, a in tot.items() if a >= 1e-3 * big and lo + 1e-3 < h < hi - 1e-3)
+    bounds = [lo] + inner + [hi]
+    return [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b - a > 1e-3], float(area[flat].sum() / 2)
+
+
+def choose_plane(tri):
+    """The slicing plane. Candidates: X, Y, Z and the normals of the 4 largest flat regions (other than those).
+    Score: the share of the height whose slabs keep one loop count at 3 heights (what loft.py can build), then the
+    area of the faces square to it (end faces, shoulders), then fewer slabs."""
+    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    area = np.linalg.norm(n, axis=1)
+    un = n / np.maximum(area[:, None], 1e-300)
+    un *= np.where((un[:, 0] < -1e-9) | ((np.abs(un[:, 0]) <= 1e-9) & (un[:, 1] < -1e-9))
+                   | ((np.abs(un[:, 0]) <= 1e-9) & (np.abs(un[:, 1]) <= 1e-9) & (un[:, 2] < 0)), -1, 1)[:, None]
+    bins = {}
+    for k, a, v in zip(map(tuple, np.round(un, 2)), area, un):
+        b = bins.setdefault(k, [0.0, np.zeros(3)]); b[0] += a; b[1] += a * v
+    cands = [np.eye(3)[i] for i in range(3)]
+    for a, v in sorted(bins.values(), key=lambda b: -b[0]):
+        v = v / np.linalg.norm(v)
+        if all(abs(v @ c) < math.cos(math.radians(2)) for c in cands):
+            cands.append(v)
+        if len(cands) == 7: break
+    best = None
+    for d in cands:
+        F = frame(d); t = tri @ F.T
+        slabs, flat_area = slabs_of(t)
+        H = t[:, :, 2].max() - t[:, :, 2].min()
+        ok = 0.0
+        for z0, z1 in slabs:
+            e = 1e-3 * (z1 - z0)
+            if len({len(section_loops(section_n(t, 2, h)[0])) for h in (z0 + e, 0.5 * (z0 + z1), z1 - e)}) == 1:
+                ok += z1 - z0
+        score = (round(ok / H, 2), round(flat_area / (area.sum() / 2), 2), -len(slabs))
+        print("plane normal (%.3f %.3f %.3f): buildable %.2f square flat area %.2f slabs %d" % (
+            *d, score[0], score[1], len(slabs)), flush=True)
+        if best is None or score > best[0]: best = (score, F)
+    return best[1]
+
+
 def main():
     t0 = time.time()
     tri = load(sys.argv[1]); N = int(sys.argv[3]) if len(sys.argv) > 3 else 60
     lo = tri.reshape(-1, 3).min(0); hi = tri.reshape(-1, 3).max(0)
     diag = float(np.linalg.norm(hi - lo))
     auto2d.LINE_TOL = auto2d.ARC_TOL = max(0.02, 2e-4 * diag)
-    # 1. the slicing plane: the stepped builder's axis
-    best = None
-    for ax in range(3):
-        _, _, lv = levels_for_axis(tri, ax, lo, hi, N)
-        score = (len([l for l in lv if l[1] - l[0] + 1 >= 2]), len(lv))
-        if best is None or score < best[0]: best = (score, ax)
-    ax = int(os.environ["AXIS"]) if os.environ.get("AXIS") in ("0", "1", "2") else best[1]
-    print("axis %s" % "XYZ"[ax], flush=True)
-    # 2. slabs between the heights of the horizontal faces
-    n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
-    area = np.linalg.norm(n, axis=1)
-    flat = np.abs(n[:, ax]) > 0.99 * np.maximum(area, 1e-300)
-    hz = np.round(tri[flat][:, :, ax].mean(1), 3)
-    tot = {}
-    for h, a in zip(hz, area[flat]):
-        tot[h] = tot.get(h, 0.0) + a
-    big = max(tot.values()) if tot else 0.0
-    inner = sorted(h for h, a in tot.items() if a >= 1e-3 * big and lo[ax] + 1e-3 < h < hi[ax] - 1e-3)
-    bounds = [lo[ax]] + inner + [hi[ax]]
-    slabs = [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b - a > 1e-3]
-    step = (hi[ax] - lo[ax]) / N
+    # 1. the slicing plane; the mesh turned so its normal is Z
+    F = (frame(np.eye(3)[int(os.environ["AXIS"])]) if os.environ.get("AXIS") in ("0", "1", "2")
+         else choose_plane(tri))
+    print("slicing plane normal (%.4f %.4f %.4f)" % tuple(F[2]), flush=True)
+    t = tri @ F.T
+    # 2. slabs between the heights of the faces square to it
+    slabs, _ = slabs_of(t)
+    step = (t[:, :, 2].max() - t[:, :, 2].min()) / N
     # 3. each slab
     parts = []
     for k, (z0, z1) in enumerate(slabs):
-        parts.extend(build_slab(tri, ax, z0, z1, step, k))
+        parts.extend(build_slab(t, 2, z0, z1, step, k))
     if not parts:
         print("nothing built"); return 2
-    # 4. one solid
+    # 4. one solid, turned back
     shape = parts[0]
     for s in parts[1:]:
         shape = BRepAlgoAPI_Fuse(shape, s).Shape()
+    if not np.allclose(F, np.eye(3)):
+        tr = gp_Trsf()     # world = F^T @ local
+        G = F.T.tolist()
+        tr.SetValues(*G[0], 0.0, *G[1], 0.0, *G[2], 0.0)
+        shape = BRepBuilderAPI_Transform(shape, tr, True).Shape()
     finish(shape, tri, sys.argv[2], t0)
     return 0
 

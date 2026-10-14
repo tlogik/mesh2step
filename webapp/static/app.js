@@ -1232,7 +1232,15 @@ const PHASE_WORDS = {
   'turned-envelope': 'looking for a turned shape',
   turned: 'cutting the turned shape',
   block: 'rebuilding as a block with features',
+  loft: 'slicing along the main plane and lofting the tapered sections',
   feature: 'choosing the best feature build',
+};
+
+// how the served feature build was made, in Options > Details
+const FEATURE_NAMES = {
+  'extrude-x': 'extruded profile (X)', 'extrude-y': 'extruded profile (Y)', 'extrude-z': 'extruded profile (Z)',
+  stepped: 'stepped levels', 'turned-envelope': 'turned shape', turned: 'turned shape with cuts',
+  block: 'block with features', loft: 'slice and loft', edgebuild: 'shape rebuilt from its edges',
 };
 
 // the engine, the shape rebuild and the feature builds run side by side: say where each one is
@@ -1326,7 +1334,10 @@ function renderResult(data) {
     const cyls = s.smooth_built_cylinders ?? s.smooth_cylinders;
     if (planes) bits.push(`${planes} flat face${planes === 1 ? '' : 's'}`);
     if (cyls) bits.push(`${cyls} round face${cyls === 1 ? '' : 's'}`);
-    if (bits.length) lines.push('Rebuilt ' + bits.join(' and '));
+    // a slice-and-loft build: its tapered and free-form walls are lofted through the slices
+    const lofted = s.feature_method === 'loft' ? (s.n_faces_built || 0) - (planes || 0) - (cyls || 0) : 0;
+    if (lofted > 0) bits.push(`${lofted} lofted face${lofted === 1 ? '' : 's'}`);
+    if (bits.length) lines.push('Rebuilt ' + (bits.length > 1 ? bits.slice(0, -1).join(', ') + ' and ' + bits.at(-1) : bits[0]));
     const lost = (s.smooth_cylinders || 0) - (cyls || 0);
     if (lost > 0) lines.push(`${lost} round face${lost === 1 ? ' was' : 's were'} found in the mesh but could not be built`);
     else if (s.n_faces_built) lines.push(`${s.n_faces_built.toLocaleString()} surfaces`);
@@ -1479,7 +1490,7 @@ function renderTrueformStats(data) {
   if (s.smooth_planes != null) {
     html += row('smooth', `planes ${s.smooth_planes} · cylinders ${s.smooth_cylinders} · fillets ${s.smooth_fillets} · components ${s.smooth_built_components}`);
   }
-  if (s.feature_method) html += row('feature build', s.feature_method);
+  if (s.feature_method) html += row('feature build', FEATURE_NAMES[s.feature_method] || s.feature_method);
   html += row('output', `${s.schema.toUpperCase()} · ${s.seconds.toFixed(2)}s`);
     statsEl.innerHTML = html;
   statsEl.classList.remove('hidden');
