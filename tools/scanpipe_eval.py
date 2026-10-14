@@ -31,7 +31,9 @@ VARIANTS = ("plain", "truth", "ransac")
 
 
 def build(stl, out, labels=None):
-    cmd = [sys.executable, str(ROOT / "tools/feature_recon/edgebuild.py"), str(stl), str(out)]
+    # SCANEVAL_BUILDER=cellbuild: the builder the server runs for scans (bd projects-vgj7.1)
+    script = "cellbuild.py" if os.environ.get("SCANEVAL_BUILDER") == "cellbuild" else "edgebuild.py"
+    cmd = [sys.executable, str(ROOT / "tools/feature_recon" / script), str(stl), str(out)]
     if labels:
         cmd += ["--labels", str(labels)]
     t0 = time.time()

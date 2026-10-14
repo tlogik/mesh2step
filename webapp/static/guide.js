@@ -1,6 +1,6 @@
 // guided feature selection — written in M3 (see .claude/loopspec/guided-m3-guide-ui.spec.md)
 export async function startGuide(ctx) {
-  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls } = ctx;
+  const { THREE, scene, camera, canvas, token, panel, hideOthers, showResult, controls, scan } = ctx;
   hideOthers();
   // Make panel fixed on top of the canvas so buttons are clickable
   panel.style.cssText = 'position:fixed;top:10px;right:10px;width:280px;z-index:99999;background:#fff;padding:10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.3);font-family:system-ui,sans-serif;font-size:14px;';
@@ -27,7 +27,7 @@ export async function startGuide(ctx) {
     brushR = geo.boundingBox.getSize(new THREE.Vector3()).length() * 0.02;
     return meshData;
   }
-  await loadMesh(false);
+  await loadMesh(!!scan);     // declared a scan at upload: the server already prepped it and detect is running
 
   const mat = new THREE.MeshStandardMaterial({ vertexColors: true, flatShading: true, side: THREE.DoubleSide });
   const mesh = new THREE.Mesh(geo, mat);
@@ -82,6 +82,7 @@ export async function startGuide(ctx) {
   buildBtn.style.display = 'none';
   const scanBtn = el('button', 'guide-scan', 'This is a 3D scan');
   scanBtn.title = 'Denoise the mesh, suggest surfaces found in the scan, and fit brushed areas on the raw scan';
+  if (scan) { scanBtn.disabled = true; scanBtn.textContent = '3D scan mode'; }
   const brushBtn = el('button', 'guide-brush', 'Brush');
   brushBtn.title = 'Paint a face (drag), then Fit: the surface of the current kind through the painted area';
   const brushSize = el('input', 'guide-brush-size');

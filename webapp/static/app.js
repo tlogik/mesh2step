@@ -1161,6 +1161,8 @@ convertBtn.addEventListener('click', async () => {
   if (cutOps.length) {
     fd.append('cuts', JSON.stringify(cutOps));
   }
+  // a scan skips the CAD builders: they fit exact surfaces and find nothing in scanner noise (bd projects-vgj7.3)
+  if (document.getElementById('scan-toggle').checked) fd.append('scan', 'true');
   if (engine !== 'faceted') {
     fd.append('unify_angle', document.getElementById('unify-angle-num').value);
     if (document.getElementById('feature-toggle').checked) fd.append('feature', 'true');
@@ -1193,6 +1195,7 @@ convertBtn.addEventListener('click', async () => {
 // things and nothing else.
 const PHASE_WORDS = {
   prepare: 'reading the mesh',
+  scan: 'cleaning up the scan',
   engine: 'building surfaces from the mesh',
   retry: 'rebuilding a face that did not survive the first write',
   edgebuild: 'rebuilding the shape from its edges',
@@ -1274,6 +1277,16 @@ function renderResult(data) {
     showFailure(s.error || 'unknown reason');
     return;
   }
+  if (data.scan) {
+    // nothing to download yet: the solid comes from the surfaces the user picks
+    statusEl.className = 'convert-status hidden';
+    resultEl.innerHTML = '<div class="result-head good">Scan ready — pick its surfaces</div>'
+      + `<div class="result-line quiet">${s.n_prep_tris.toLocaleString()} triangles after cleanup · ${s.seconds.toFixed(1)}s</div>`
+      + '<div id="guide-host"></div>';
+    resultEl.classList.remove('hidden');
+    openGuide(data.download_token, true);
+    return;
+  }
   const lines = [];
   if (s.rebuilt) {
     lines.push(`Rebuilt ${s.rebuilt_bands} round surface${s.rebuilt_bands === 1 ? '' : 's'} as true CAD geometry`);
@@ -1305,21 +1318,25 @@ function renderResult(data) {
     window.location.href = `api/download/${data.download_token}`;
   });
   // guided feature selection (owner 2026-10-12): the user picks features kind by kind, no AI
-  document.getElementById('guide-start').addEventListener('click', async (e) => {
+  document.getElementById('guide-start').addEventListener('click', (e) => {
     e.target.disabled = true;
-    const { startGuide } = await import('./guide.js');
-    startGuide({
-      THREE, scene, camera, canvas, controls, token: data.download_token,
-      panel: document.getElementById('guide-host'),
-      hideOthers: () => {
-        for (const o of [currentMesh, resultMesh, resultEdges, leftoverMesh]) if (o) o.visible = false;
-        viewSelect.disabled = true;
-      },
-      showResult: (tok) => showResultPreview(tok),
-    });
+    openGuide(data.download_token, false);
   });
   renderStats(data);
   showResultPreview(data.download_token);
+}
+
+async function openGuide(token, scan) {
+  const { startGuide } = await import('./guide.js');
+  startGuide({
+    THREE, scene, camera, canvas, controls, token, scan,
+    panel: document.getElementById('guide-host'),
+    hideOthers: () => {
+      for (const o of [currentMesh, resultMesh, resultEdges, leftoverMesh]) if (o) o.visible = false;
+      viewSelect.disabled = true;
+    },
+    showResult: (tok) => showResultPreview(tok),
+  });
 }
 
 function renderStats(data) {
