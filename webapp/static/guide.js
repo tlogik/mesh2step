@@ -131,6 +131,18 @@ export async function startGuide(ctx) {
       }
     }
     geo.getAttribute('color').needsUpdate = true;
+    refreshAccept();
+  }
+
+  // the dialog must answer an accept: the button says it is done and Next is the obvious way on
+  function refreshAccept() {
+    const selSet = new Set();
+    for (const s of selections) for (const t of s.triangles) selSet.add(t);
+    const done = suggested.length > 0 && suggested.every(r => r.triangles.some(t => selSet.has(t)));
+    acceptBtn.disabled = done;
+    acceptBtn.textContent = done ? 'All suggestions accepted \u2713' : 'Accept all suggestions';
+    nextBtn.style.background = done ? '#3b82f6' : '';
+    nextBtn.style.color = done ? '#fff' : '';
   }
 
   function updateUI() {
@@ -302,6 +314,8 @@ export async function startGuide(ctx) {
         for (const t of tris) selSet.add(t);
       }
     }
+    const n = selections.filter(s => s.kind === kind).length;
+    paramsEl.textContent = `${n} ${steps[step][1].toLowerCase()} selected \u2014 press Next to continue`;
     recolour();
   });
 

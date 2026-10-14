@@ -220,3 +220,36 @@ def test_scan_declared_at_upload(live_url, tmp_path):
         assert any(f"radius {r} mm" in txt for r in ("3.9", "4.0", "4.1")), txt
         assert errors == [], errors
         b.close()
+
+
+def test_accept_all_answers_in_the_dialog(live_url, tmp_path):
+    """After "Accept all suggestions" the dialog must change: the button says it is done, the text points to Next
+    (2026-10-14: on a CAD export nothing visible changed and the user could not tell the click had worked)."""
+    mesh, _, _, _ = G.tessellate(G.part())
+    stl = tmp_path / "plate.stl"
+    mesh.export(str(stl))
+    with playwright_api.sync_playwright() as pw:
+        b = pw.chromium.launch(args=["--use-gl=swiftshader", "--enable-unsafe-swiftshader"])
+        page = b.new_page(viewport={"width": 1280, "height": 900})
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(live_url, wait_until="networkidle", timeout=60000)
+        page.evaluate("document.getElementById('welcome-overlay').classList.add('hidden')")
+        page.set_input_files("#file-input", str(stl))
+        page.wait_for_timeout(1500)
+        page.click("#convert-btn")
+        page.wait_for_function("() => { const r = document.getElementById('result-card');"
+                               " return r && !r.classList.contains('hidden'); }", timeout=180000)
+        page.click("#guide-start")
+        page.wait_for_function("() => { const e = document.getElementById('guide-params');"
+                               " return e ? /suggestion/.test(e.textContent) : false; }", timeout=120000)
+        assert page.is_enabled("#guide-accept-all")
+        page.click("#guide-accept-all")
+        assert page.is_disabled("#guide-accept-all")
+        assert "accepted" in page.inner_text("#guide-accept-all")
+        assert "press Next" in page.inner_text("#guide-params")
+        page.click("#guide-next")
+        page.wait_for_function("() => !document.getElementById('guide-accept-all').disabled", timeout=60000)
+        assert page.inner_text("#guide-accept-all") == "Accept all suggestions"
+        assert errors == [], errors
+        b.close()
