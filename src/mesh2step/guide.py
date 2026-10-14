@@ -295,8 +295,8 @@ def suggest(tri, kind):
             continue
         model, surface, params = result
         full = _is_full(model, V, F, tris, surface)
-        if kind == "cylinder" and not full:
-            continue
+        # partial cylinders are offered here too: a half tube's walls are cylinders to the user, not fillets (2026-10-14,
+        # MezzoTuboTappato: both walls found, offered only at step 5). The build is the same either way
         if kind == "fillet" and full:
             continue
         results.append({

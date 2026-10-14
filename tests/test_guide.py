@@ -100,3 +100,13 @@ def test_labels_for_edgebuild(part):
     assert lab["kinds"] == {"0": "cylinder", "1": "torus", "2": "plane"}
     with pytest.raises(ValueError, match="twice"):
         guide.labels(len(tri), [{"kind": "cylinder", "triangles": [3]}, {"kind": "cone", "triangles": [3]}])
+
+
+def test_suggest_cylinders_offers_partial_cylinders():
+    """A half tube's walls are partial cylinders; the Cylinders step must offer them, not only the Fillets step."""
+    import trimesh
+
+    tube = trimesh.creation.annulus(r_min=61.5, r_max=63.5, height=200, sections=48)
+    half = tube.slice_plane([0, 0, 0], [0, 1, 0], cap=True)
+    radii = sorted(round(r["params"]["radius"], 1) for r in guide.suggest(half.triangles, "cylinder"))
+    assert radii == [61.5, 63.5], radii
