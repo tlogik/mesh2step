@@ -267,7 +267,19 @@ def extend_caps(s, z0, z1):
     return s, add
 
 
+class RetryBudget(Exception):
+    pass
+
+
 def assemble(t, leaves):
+    try:
+        return _assemble(t, leaves, [0.0])
+    except RetryBudget as e:
+        print("assemble: retry budget spent (%s)" % e, flush=True)
+        return None
+
+
+def _assemble(t, leaves, spent):
     """One solid from the leaves, bottom-up (Kimi's assemble5, measured on mechparts/6). Two slabs that meet at one
     height have flat end faces of slightly different outline; their fuse can collapse silently (an EMPTY non-null
     shape, -69% volume) or leave a shape every later fuse collapses on. So every fuse is accepted only if valid, a
@@ -306,10 +318,19 @@ def assemble(t, leaves):
         v = vol(r)
         return (r, v) if solid_ok(r) and abs(v - have - nom) <= 0.03 * nom + 200 else None
 
+    cap = float(os.environ.get("LOFT_RETRY_S", "30"))
+
     def rebuild(plan):
+        """Only the retries go through here. Their cost is quadratic in the group (every tail position refuses it from
+        the bottom), so a part whose fuses keep breaking spent its whole budget here (convogliatore: 240 s, killed);
+        the time is summed and, past LOFT_RETRY_S, the build fails at once and the next candidate gets its turn."""
         acc = (None, 0.0)
         for i, kind, ext in plan:
+            t1 = time.time()
             acc = onto(*acc, i, kind, ext)
+            spent[0] += time.time() - t1
+            if spent[0] > cap:
+                raise RetryBudget("%.0f s of prism-tail rebuilds, z %.3f..%.3f" % (spent[0], *leaves[i][:2]))
             if acc is None:
                 return None
         return acc
@@ -360,7 +381,7 @@ def assemble(t, leaves):
         else:
             print("assemble: groups do not join (%d groups)" % len(groups), flush=True); return None
     n = sum(1 for _, k, _ in plan if k == "built")
-    print("assembled: %d groups, %d lofted leaves, %d prisms" % (len(groups), n, len(plan) - n), flush=True)
+    print("assembled: %d groups, %d lofted leaves, %d prisms, %.0f s in retries" % (len(groups), n, len(plan) - n, spent[0]), flush=True)
     return shape
 
 
