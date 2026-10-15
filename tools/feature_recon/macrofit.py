@@ -53,7 +53,13 @@ def decimate(mesh, n=5000):
             if len(F) <= 1.2 * n:
                 break
             V, F = fs.simplify(V, F, target_count=int(n), agg=10)
-        return trimesh.Trimesh(V, F, process=False)
+        m = trimesh.Trimesh(V, F, process=False)
+        # the simplifier leaves zero-area and duplicate faces: curvature() pinv's a singular ring and does not converge
+        m.update_faces(m.nondegenerate_faces(height=1e-9 * max(float(np.ptp(V, axis=0).max()), 1e-9)))
+        m.update_faces(m.unique_faces())
+        m.remove_unreferenced_vertices()
+        m.merge_vertices()
+        return m
     o = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(np.asarray(mesh.vertices)),
                                   o3d.utility.Vector3iVector(np.asarray(mesh.faces)))
     d = o.simplify_quadric_decimation(int(n))
