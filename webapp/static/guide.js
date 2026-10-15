@@ -113,6 +113,72 @@ export async function startGuide(ctx) {
   for (const [c, t] of [['#f59e0b', 'suggested'], ['#4ade80', 'selected'], ['#3b82f6', 'painted']]) {
     row('display:flex;align-items:center;gap:4px;', legend).innerHTML = `<span style="width:10px;height:10px;border-radius:2px;background:${c};display:inline-block"></span>${t}`;
   }
+  // --- structure (scan mode): what the native sections of the scan say about corners and hole mouths ---
+  const structEl = el('div', 'guide-structure');
+  structEl.style.cssText = 'display:none;border:1px solid #e5e7eb;border-radius:6px;padding:6px 8px;margin:4px 0 8px;font-size:12px;color:#333;max-height:190px;overflow:auto;';
+  const MOUTH = { straight: 'plain', countersink: 'countersink', chamfer: 'chamfer', counterbore: 'counterbore',
+    fillet: 'rounded', blind: 'blind', other: '?' };
+  const sceneMarks = new THREE.Group();
+  scene.add(sceneMarks);
+  function mark(points, closed) {
+    sceneMarks.clear();
+    if (!points || points.length < 2) return;
+    const g = new THREE.BufferGeometry().setFromPoints(points.map((p) => new THREE.Vector3(p[0], p[1], p[2])));
+    sceneMarks.add(new THREE.Line(g, new THREE.LineBasicMaterial({ color: 0xef4444, depthTest: false })));
+  }
+  function structRow(text, onHover) {
+    const r = document.createElement('div');
+    r.textContent = text;
+    r.style.cssText = 'padding:1px 0;cursor:default;';
+    r.addEventListener('mouseenter', () => { r.style.background = '#fee2e2'; onHover && onHover(); });
+    r.addEventListener('mouseleave', () => { r.style.background = ''; sceneMarks.clear(); });
+    structEl.appendChild(r);
+    return r;
+  }
+  function fmt(x) { return (Math.round(x * 100) / 100).toString(); }
+  async function loadStructure() {
+    let d;
+    try { d = await (await fetch(`api/guide/${token}/structure`)).json(); } catch (_) { return; }
+    if (closed) return;
+    if (d.status === 'pending') {
+      structEl.style.display = '';
+      structEl.textContent = 'Measuring corners and holes\u2026';
+      setTimeout(loadStructure, 3000);
+      return;
+    }
+    if (d.status !== 'done') { structEl.style.display = 'none'; return; }
+    structEl.textContent = '';
+    structEl.style.display = '';
+    const title = document.createElement('div');
+    title.textContent = 'Measured on the scan';
+    title.style.cssText = 'font-weight:600;margin-bottom:3px;';
+    structEl.appendChild(title);
+    const hs = d.holes.filter((h) => h.votes >= 2);
+    if (hs.length) {
+      const t = document.createElement('div'); t.textContent = `Holes (${hs.length})`; t.style.cssText = 'color:#666;margin-top:2px;'; structEl.appendChild(t);
+      for (const h of hs) {
+        const [a, b] = h.ends.map((e) => MOUTH[e] || e);
+        const half = Math.max(h.radius * 3, 1);
+        const c = h.centre, ax = h.axis;
+        structRow(`\u00d8${fmt(2 * h.radius)} \u2014 ${a} / ${b}`, () => mark([
+          [c[0] - ax[0] * half, c[1] - ax[1] * half, c[2] - ax[2] * half],
+          [c[0] + ax[0] * half, c[1] + ax[1] * half, c[2] + ax[2] * half]]));
+      }
+    }
+    const kinds = { fillet: [], chamfer: [], sharp: [] };
+    for (const e of d.edges) (kinds[e.type] || (kinds[e.type] = [])).push(e);
+    const note = `Corners: ${kinds.sharp.length} sharp, ${kinds.fillet.length} rounded, ${kinds.chamfer.length} chamfered`;
+    const t2 = document.createElement('div'); t2.textContent = note; t2.style.cssText = 'color:#666;margin-top:4px;'; structEl.appendChild(t2);
+    for (const e of [...kinds.fillet, ...kinds.chamfer]) {
+      const what = e.type === 'fillet' ? `R${fmt(e.radius)} round` : `${fmt(e.width)} chamfer`;
+      structRow(what, () => mark(e.points));
+    }
+    if (!hs.length && !kinds.fillet.length && !kinds.chamfer.length) {
+      const z = document.createElement('div'); z.textContent = 'No rounded or chamfered corners and no clear holes found.'; structEl.appendChild(z);
+    }
+  }
+  if (scan) loadStructure();
+
   const statusEl = el('div', 'guide-status');
   statusEl.style.cssText = 'color:#c00;font-size:13px;margin:2px 0;';
 
@@ -380,6 +446,7 @@ export async function startGuide(ctx) {
       selections = []; painted = new Set();
       statusEl.textContent = 'Finding surfaces in the scan\u2026';
       scanBtn.textContent = '3D scan mode';
+      loadStructure();
       await enterStep();
       statusEl.textContent = '';
     } catch (e2) {
@@ -429,6 +496,7 @@ export async function startGuide(ctx) {
     closed = true;
     setBrush(false);
     scene.remove(mesh);
+    scene.remove(sceneMarks);
     panel.innerHTML = '';
     delete window.__guide;
   }

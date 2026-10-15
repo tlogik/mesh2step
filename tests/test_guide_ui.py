@@ -286,3 +286,37 @@ def test_file_ready_dialog_downloads_the_step(live_url, tmp_path):
         assert not page.is_visible("#ready-dialog")
         assert errors == [], errors
         b.close()
+
+
+def test_scan_panel_lists_corners_and_holes(live_url, tmp_path):
+    """bd projects-srfb: the scan's guided step shows what native sections measured: the dia 10 hole and the rounds."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+    import re
+
+    import scanbench as B
+
+    mesh = G.tessellate(G.part())[0]
+    mesh.merge_vertices()
+    stl = tmp_path / "plate_scan.stl"
+    B.scanify(mesh).export(str(stl))
+    with playwright_api.sync_playwright() as pw:
+        b = pw.chromium.launch(args=["--use-gl=swiftshader", "--enable-unsafe-swiftshader"])
+        page = b.new_page(viewport={"width": 1280, "height": 900})
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        page.goto(live_url, wait_until="networkidle", timeout=60000)
+        page.evaluate("document.getElementById('welcome-overlay').classList.add('hidden')")
+        page.set_input_files("#file-input", str(stl))
+        page.wait_for_timeout(1500)
+        page.check("#scan-toggle")
+        page.click("#convert-btn")
+        page.wait_for_function("() => /Measured on the scan/.test(document.getElementById('guide-structure')?.textContent || '')",
+                               timeout=120000)
+        txt = page.inner_text("#guide-structure")
+        assert re.search(r"\u00d8(9\.[5-9]|10|10\.[0-4])", txt), txt          # the dia 10 hole
+        assert re.search(r"Corners: \d+ sharp", txt), txt
+        rows = page.locator("#guide-structure div")
+        assert rows.count() >= 3
+        rows.nth(2).hover()                       # a row marks its feature in the scene without an error
+        assert errors == [], errors
+        b.close()

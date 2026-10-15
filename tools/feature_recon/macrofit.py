@@ -32,38 +32,25 @@ def _mesh(tri):
 
 
 def decimate(mesh, n=5000):
-    """quadric decimation to n triangles. open3d reaches the target; fast_simplification stalls at ~50% on flat,
-    densely subdivided surfaces. open3d's import chain reaches stdlib `profile`, which tools/feature_recon shadows"""
+    """quadric decimation to ~n triangles by fast_simplification, the same code on every node (open3d reaches the
+    target but is not installed everywhere, and two decimators gave two answers on the same scan). It stalls near half
+    on flat densely subdivided meshes: a few passes, then the leftover is cleaned (zero-area and duplicate faces make
+    scanransac.curvature fail to converge)."""
+    import fast_simplification as fs
     import trimesh
     if len(mesh.faces) <= n:
         return mesh
-    here = str(Path(__file__).resolve().parent)
-    saved = sys.path[:]
-    sys.path[:] = [p for p in sys.path if str(Path(p or ".").resolve()) != here]
-    try:
-        import open3d as o3d
-    except ImportError:         # a node without open3d: fast_simplification stalls near half but never fails
-        o3d = None
-    finally:
-        sys.path[:] = saved
-    if o3d is None:
-        import fast_simplification as fs
-        V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces)
-        for _ in range(4):
-            if len(F) <= 1.2 * n:
-                break
-            V, F = fs.simplify(V, F, target_count=int(n), agg=10)
-        m = trimesh.Trimesh(V, F, process=False)
-        # the simplifier leaves zero-area and duplicate faces: curvature() pinv's a singular ring and does not converge
-        m.update_faces(m.nondegenerate_faces(height=1e-9 * max(float(np.ptp(V, axis=0).max()), 1e-9)))
-        m.update_faces(m.unique_faces())
-        m.remove_unreferenced_vertices()
-        m.merge_vertices()
-        return m
-    o = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(np.asarray(mesh.vertices)),
-                                  o3d.utility.Vector3iVector(np.asarray(mesh.faces)))
-    d = o.simplify_quadric_decimation(int(n))
-    return trimesh.Trimesh(np.asarray(d.vertices), np.asarray(d.triangles), process=False)
+    V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces)
+    for _ in range(4):
+        if len(F) <= 1.2 * n:
+            break
+        V, F = fs.simplify(V, F, target_count=int(n), agg=10)
+    m = trimesh.Trimesh(V, F, process=False)
+    m.update_faces(m.nondegenerate_faces(height=1e-9 * max(float(np.ptp(V, axis=0).max()), 1e-9)))
+    m.update_faces(m.unique_faces())
+    m.remove_unreferenced_vertices()
+    m.merge_vertices()
+    return m
 
 
 def macro(tri, n=5000):
