@@ -42,8 +42,18 @@ def decimate(mesh, n=5000):
     sys.path[:] = [p for p in sys.path if str(Path(p or ".").resolve()) != here]
     try:
         import open3d as o3d
+    except ImportError:         # a node without open3d: fast_simplification stalls near half but never fails
+        o3d = None
     finally:
         sys.path[:] = saved
+    if o3d is None:
+        import fast_simplification as fs
+        V, F = np.asarray(mesh.vertices, float), np.asarray(mesh.faces)
+        for _ in range(4):
+            if len(F) <= 1.2 * n:
+                break
+            V, F = fs.simplify(V, F, target_count=int(n), agg=10)
+        return trimesh.Trimesh(V, F, process=False)
     o = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(np.asarray(mesh.vertices)),
                                   o3d.utility.Vector3iVector(np.asarray(mesh.faces)))
     d = o.simplify_quadric_decimation(int(n))
