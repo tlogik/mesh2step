@@ -55,18 +55,21 @@ def _label_end(collected, sign, radius, closed=False):
         return "blind"
     if not kinds:
         return "straight"
-    if len(kinds) == 1 and kinds[0] == "OBL":
-        p0, p1 = collected[0][1], collected[0][2]
-        if abs(p1[1] - p0[1]) >= 0.25 * radius:
-            return "countersink"
-        return "chamfer"
-    if len(kinds) == 1 and kinds[0] == "ARC":
-        return "fillet"
-    if len(kinds) == 2 and kinds[0] == "PERP" and kinds[1] == "AX":
-        ax = collected[1]
-        s_val = abs((ax[1][1] + ax[2][1]) / 2)
-        if s_val > radius:
+    # counterbore: a floor (flat, maybe with a fillet in front of it) then a WIDER axial wall
+    for i, (k, p) in enumerate(zip(kinds, collected)):
+        if k == "AX" and abs((p[1][1] + p[2][1]) / 2) > 1.05 * radius and "PERP" in kinds[:i] \
+                and all(x in ("ARC", "PERP") for x in kinds[:i]):
             return "counterbore"
+    # otherwise the first thing after the wall is the mouth; what follows is the part around the hole (steps, ribs)
+    k0, p0 = kinds[0], collected[0]
+    if k0 == "OBL":
+        return "countersink" if abs(p0[2][1] - p0[1][1]) >= 0.25 * radius else "chamfer"
+    if k0 == "ARC":
+        # a round-over of the hole's edge is centred in the material at s = r + R, tangent to the wall; any other arc
+        # is the part around the hole (a boss, a rib, the coarse polygon of a neighbour)
+        R = float(p0[2])
+        cs = abs(p0[1][1])
+        return "fillet" if abs(cs - (radius + R)) <= 0.25 * R + 0.05 * radius and R <= 2.0 * radius else "other"
     return "other"
 
 
