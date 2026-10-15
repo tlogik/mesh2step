@@ -213,8 +213,14 @@ def classify(tri, origin, axis, radius, tol=None, trace=None):
                     if kind == "PERP":
                         next_idx = (idx + direction) % n_prims
                         if next_idx != wall_idx:
-                            if (_label_prim(prims[next_idx], sign) == "AX"
-                                    and _is_bore_like(prims[next_idx], sign) and _near(prims[next_idx])):
+                            nx = prims[next_idx]
+                            # a counterbore wall rises from the floor on the side AWAY from the bore; a neighbouring
+                            # hole's wall drops from the same face on the bore's own side (perforated plates)
+                            zf = (prim[1][0] + prim[2][0]) / 2
+                            zw = (prims[wall_idx][1][0] + prims[wall_idx][2][0]) / 2
+                            zx = (nx[1][0] + nx[2][0]) / 2 if nx[0] == "line" else zf
+                            if (_label_prim(nx, sign) == "AX" and _is_bore_like(nx, sign) and _near(nx)
+                                    and (zx - zf) * (zw - zf) < 0):
                                 collected.append(prim)
                                 continue
                         if _reaches_axis(prim, sign, radius):
