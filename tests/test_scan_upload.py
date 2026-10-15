@@ -97,3 +97,23 @@ def test_suggest_serves_partial_regions_while_detect_runs(scan_stl, tmp_path):
     assert d["pending"] is True and d["regions"][0]["triangles"] == list(range(40)), d
     sc["prog"] = tmp_path / "missing.pkl"   # nothing published yet: no regions, still pending
     assert client.get(f"/api/guide/{tok}/suggest", params={"kind": "cylinder"}).json() == {"regions": [], "pending": True}
+
+
+def test_structure_endpoint_reads_corners_and_holes(scan_stl):
+    """bd projects-srfb: native sections of the scan give the corners between primitives and the mouth of each hole.
+    The plate has a dia 10 hole along Z, an r4 vertical fillet and a countersink (tests/guided_part.py)."""
+    client = TestClient(server.app)
+    d = _convert(client, scan_stl, scan="true")
+    tok = d["download_token"]
+    client.get(f"/api/guide/{tok}/mesh", params={"scan": "true"})
+    r = {}
+    for _ in range(240):
+        r = client.get(f"/api/guide/{tok}/structure").json()
+        if r["status"] != "pending":
+            break
+        time.sleep(0.5)
+    assert r["status"] == "done", r
+    assert r["edges"], "no corner measured on a plate with a fillet, a countersink and sharp edges"
+    kinds = {e["type"] for e in r["edges"]}
+    assert "fillet" in kinds or "chamfer" in kinds, kinds
+    assert any(abs(h["radius"] - 5.0) < 1.0 for h in r["holes"]), r["holes"]
