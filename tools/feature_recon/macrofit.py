@@ -301,11 +301,10 @@ def _corner(poly, tol, expect=None):
     return out
 
 
-def run(tri, n=5000, window=None):
+def run(tri, n=5000, window=None, M=None):
     """{"primitives": {id: {"kind","params","area"}}, "edges": [{"a","b","kinds","n_cuts","type","radius"|"width",
     "blunt","points"}]}"""
-    M = macro(tri, n)
-    V = np.asarray(M["mesh"].vertices)
+    M = M or macro(tri, n)
     diag = float(np.linalg.norm(tri.reshape(-1, 3).max(0) - tri.reshape(-1, 3).min(0)))
     window = window or 0.04 * diag
     A = np.asarray(M["mesh"].area_faces)

@@ -1857,8 +1857,12 @@ def _scan(job):
         from scanransac import detect
 
         prog = stl.with_suffix(".det.pkl")      # the regions detect has accepted so far, read while it runs
+        import structure
+
         job["scan"] = {"raw": raw, "prep": pm, "stl": stl, "noise": _noise(raw.vertices, raw.faces), "prog": prog,
-                       "det": _detect_async(detect, pm, progress=str(prog))}
+                       "det": _detect_async(detect, pm, progress=str(prog)),
+                       # corners and hole mouths from native sections of the ORIGINAL scan (bd projects-srfb)
+                       "struct": _detect_async(structure.analyze, raw.triangles, pool="struct")}
         job["tri"] = pm.triangles
         job.pop("suggest", None)
     return job["scan"]
@@ -1898,18 +1902,25 @@ def _new_scan_pool():
 
 
 _SCAN_POOL = None
+_STRUCT_POOL = None         # structure.analyze beside detect: neither waits for the other
 
 
-def _detect_async(fn, mesh, **kw):
-    global _SCAN_POOL
+def _detect_async(fn, mesh, pool="scan", **kw):
+    global _SCAN_POOL, _STRUCT_POOL
     from concurrent.futures.process import BrokenProcessPool
 
     for _ in range(2):          # a worker killed (OOM, restart) breaks the pool for good: replace it once
         try:
+            if pool == "struct":
+                _STRUCT_POOL = _STRUCT_POOL or _new_scan_pool()
+                return _STRUCT_POOL.submit(fn, mesh, **kw)
             _SCAN_POOL = _SCAN_POOL or _new_scan_pool()
             return _SCAN_POOL.submit(fn, mesh, **kw)
         except BrokenProcessPool:
-            _SCAN_POOL = None
+            if pool == "struct":
+                _STRUCT_POOL = None
+            else:
+                _SCAN_POOL = None
     raise RuntimeError("could not start surface detection")
 
 
@@ -1936,6 +1947,22 @@ def guide_mesh(token: str, request: Request, scan: bool = False):
         return Response(__import__("gzip").compress(body, 5), media_type="application/json",
                         headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
     return Response(body, media_type="application/json")
+
+
+@app.get("/api/guide/{token}/structure")
+def guide_structure(token: str):
+    """corners (sharp / fillet r / chamfer w) between the primitives and the mouth of every hole, from native sections
+    of the scan. {"status": "pending" | "done" | "error" | "none"}; "none" outside scan mode"""
+    job, _ = _guide_tri(token)
+    f = job.get("scan", {}).get("struct")
+    if f is None:
+        return {"status": "none"}
+    if not f.done():
+        return {"status": "pending"}
+    if f.exception():
+        print(f"SRVSCAN structure failed: {f.exception()!r}", file=sys.stderr, flush=True)
+        return {"status": "error", "error": str(f.exception())[:200]}
+    return {"status": "done", **f.result()}
 
 
 @app.get("/api/guide/{token}/suggest")
