@@ -127,6 +127,44 @@ def virtual_edges(mesh, label, kinds, params, reach=None):
     return out
 
 
+def blend_edges(mesh, label, kinds, params, tan_deg=10.0):
+    """a detected cylinder/torus tangent to two other regions IS the fillet between them: the blend is already a
+    primitive, no section needed. [{"a","b","via","type":"fillet","radius"}]"""
+    V = np.asarray(mesh.vertices, float)
+    fa = np.asarray(mesh.face_adjacency)
+    fe = np.asarray(mesh.face_adjacency_edges)
+    diff = label[fa[:, 0]] != label[fa[:, 1]]
+    touch = {}
+    for (f0, f1), (i, j) in zip(fa[diff], fe[diff]):
+        l0, l1 = int(label[f0]), int(label[f1])
+        if l0 < 0 or l1 < 0:
+            continue
+        mid = 0.5 * (V[i] + V[j])
+        touch.setdefault((l0, l1), []).append(mid)
+        touch.setdefault((l1, l0), []).append(mid)
+    out = []
+    for f, k in kinds.items():
+        if k not in ("cylinder", "torus"):
+            continue
+        tang = []
+        for (a, b), pts in touch.items():
+            if a != f or b not in kinds:
+                continue
+            X = np.array(pts)
+            na = _proj(k, params[f], X)[1]
+            nb = _proj(kinds[b], params[b], X)[1]
+            ang = np.degrees(np.arccos(np.clip(abs(np.einsum("ij,ij->i", na, nb)), 0, 1)))
+            if np.median(ang) < tan_deg and len(X) >= 2:
+                tang.append(b)
+        if len(tang) >= 2:
+            r = params[f]["radius"] if k == "cylinder" else params[f]["minor"]
+            for ai, a in enumerate(tang):
+                for b in tang[ai + 1:]:
+                    out.append({"a": int(a), "b": int(b), "via": int(f), "kinds": [kinds[a], kinds[b]],
+                                "type": "fillet", "radius": float(r)})
+    return out
+
+
 def _section(tri, p, t):
     """native section of the mesh by the plane (p, t): 3D segments (m, 2, 3)"""
     d = (tri - p) @ t
@@ -310,6 +348,8 @@ def run(tri, n=5000, window=None):
             if vals:
                 edge[k] = float(np.median(vals))
         edges.append(edge)
+    for b in blend_edges(M["mesh"], M["label"], M["kinds"], M["params"]):
+        edges.append({**b, "n_cuts": 0, "agree": 1.0, "points": []})
     return {"primitives": prim, "edges": edges, "diag": diag}
 
 
